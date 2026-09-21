@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+APP_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+export PYTHONPATH="$APP_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
+# Keep the initial local archive accessible through this development launcher.
+if [ -d "$APP_DIR/library" ] && [ -z "${CD_RIP_OUTPUT:-}" ]; then
+    export CD_RIP_OUTPUT="$APP_DIR/library"
+fi
+exec "$APP_DIR/.venv/bin/python" -m cdrip "$@"

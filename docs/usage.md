@@ -1,0 +1,66 @@
+# Usage
+
+## Storage
+
+The default archive is `~/Music/CD Rip/<disc-id>/`. Each folder contains ALAC tracks,
+embedded tags, cover art, available lyrics, extraction logs, and `job.json` for resuming.
+
+Set `CD_RIP_OUTPUT` or pass `--output` to use another archive. Pass the same output
+directory to `status`. Set `CD_RIP_STATE_DIR` to override the process-lock directory,
+normally `~/Library/Application Support/cd-rip/`.
+
+The local `./cd-rip` development launcher preserves an existing `library/` directory.
+The installed `cd-rip` command uses the default archive unless overridden.
+
+## Identification and missing metadata
+
+MusicBrainz identifies CDs by disc layout. Multiple editions prompt for a choice.
+Unidentified discs are saved with placeholder tags; Music import waits for identification.
+
+```sh
+cd-rip retry-metadata '/path/to/album'
+cd-rip retry-metadata '/path/to/album' --release MUSICBRAINZ_RELEASE_UUID
+cd-rip import-music '/path/to/album'
+```
+
+Use the UUID from a MusicBrainz **release** URL, not a release-group URL.
+These commands do not need the disc. For manual artwork, put a JPEG named `cover.jpg`
+in the album folder before retrying. Existing cached artwork and lyrics are preserved;
+move them aside before switching to a different edition if they are incorrect.
+
+Metadata comes from [MusicBrainz](https://musicbrainz.org/), artwork from the
+[Cover Art Archive](https://coverartarchive.org/), and lyrics from [LRCLIB](https://lrclib.net/).
+Lookups send disc IDs and track metadata to these services; audio stays local.
+Plain lyrics are embedded; timed lyrics are saved as `.lrc` files.
+
+## Music import
+
+macOS may ask permission for Terminal to control Music. Music's copy-files setting
+determines whether it copies the imported tracks or references the archive.
+Later tag changes do not update separate copies already imported into Music.
+No cloud upload or Sync Library settings are changed.
+
+An interrupted import is marked uncertain to avoid duplicates. Check Music before retrying:
+
+```sh
+cd-rip import-music '/path/to/album' --retry-uncertain
+```
+
+Only use this flag if the uncertain track was not added. Completed imports are skipped.
+Duplicate detection covers this tool's jobs, not previous Music imports.
+
+## Read failures
+
+Uncorrectable reads stop extraction and leave the disc inserted. Saved tracks and logs remain.
+Clean/reinsert the disc and run `cd-rip rip` to resume. If a crash leaves an unrecorded
+`.m4a`, move it aside before retrying; the tool refuses to overwrite it.
+
+Use `--no-eject` to keep a completed CD inserted, or `--device /dev/diskN` with `rip`
+to select a drive. Only mounted audio CDs are accepted.
+
+## Limits
+
+The initial hardware test covered a standard nine-track audio CD on a USB optical drive,
+including ALAC conversion, artwork, lyrics, eject, and Music import.
+Mixed-mode discs, hidden tracks, pre-emphasis, unusual gaps, and drive-offset correction
+are not validated. PCM equality confirms lossless encoding, not an independent reference rip.
