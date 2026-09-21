@@ -1,6 +1,7 @@
 """Build a local, ad-hoc-signed Mac app. Does not launch it or access a CD."""
 
 import argparse
+import importlib.metadata
 import json
 import os
 import plistlib
@@ -18,6 +19,38 @@ def run(*args):
     subprocess.run([str(a) for a in args], check=True, cwd=ROOT)
 
 
+def copy_notices(resources):
+    notices = resources / "Licenses"
+    notices.mkdir()
+    shutil.copy2(ROOT / "LICENSE", notices / "CD-Rip-GPL-3.0.txt")
+    shutil.copy2(ROOT / "THIRD_PARTY.md", notices / "THIRD_PARTY.md")
+    versions = {"python": sys.version.split()[0]}
+    for name in ("mutagen", "pyinstaller", "pyinstaller-hooks-contrib"):
+        distribution = importlib.metadata.distribution(name)
+        versions[name] = distribution.version
+        licenses = [
+            p for p in distribution.files or [] if p.name.upper().startswith(("LICENSE", "COPYING"))
+        ]
+        if not licenses:
+            raise RuntimeError(f"No installed license found for {name}")
+        for index, path in enumerate(licenses):
+            shutil.copy2(distribution.locate_file(path), notices / f"{name}-{index}-{path.name}")
+    candidates = [
+        Path(sys.base_prefix) / "LICENSE.txt",
+        Path(sys.base_prefix)
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "LICENSE.txt",
+    ]
+    python_license = next((p for p in candidates if p.is_file()), None)
+    if python_license is None:
+        raise RuntimeError(
+            "CPython LICENSE.txt is missing from this runtime; use a complete Python installation"
+        )
+    shutil.copy2(python_license, notices / "Python-LICENSE.txt")
+    (resources / "runtime-versions.json").write_text(json.dumps(versions, indent=2) + "\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -25,7 +58,12 @@ def main():
         action="store_true",
         help="Use this checkout's existing archive and legacy lock (personal builds only)",
     )
+    parser.add_argument(
+        "--sign-identity", help="Developer ID Application identity (otherwise ad-hoc signing)"
+    )
     args = parser.parse_args()
+    if args.sign_identity and args.local_config:
+        parser.error("Distribution signing cannot include personal checkout paths")
     destination = ROOT / "dist" / "CD Rip.app"
     destination.parent.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="cd-rip-build-") as temp:
@@ -75,6 +113,16 @@ def main():
             ROOT / "src",
             "--collect-all",
             "mutagen",
+            *(
+                [
+                    "--codesign-identity",
+                    args.sign_identity,
+                    "--osx-entitlements-file",
+                    str(ROOT / "mac" / "engine.entitlements.plist"),
+                ]
+                if args.sign_identity
+                else []
+            ),
             "--distpath",
             work / "engine-dist",
             "--workpath",
@@ -88,6 +136,7 @@ def main():
         resources = contents / "Resources"
         executable = contents / "MacOS"
         resources.mkdir(parents=True)
+        copy_notices(resources)
         executable.mkdir()
         shutil.copytree(work / "engine-dist" / "cd-rip-engine", resources / "engine")
         run(
@@ -141,7 +190,34 @@ def main():
         }
         with (contents / "Info.plist").open("wb") as file:
             plistlib.dump(info, file)
-        run("codesign", "--force", "--deep", "--sign", "-", bundle)
+        if args.sign_identity:
+            run(
+                "codesign",
+                "--force",
+                "--timestamp",
+                "--options",
+                "runtime",
+                "--entitlements",
+                ROOT / "mac" / "engine.entitlements.plist",
+                "--sign",
+                args.sign_identity,
+                resources / "engine" / "cd-rip-engine",
+            )
+            run(
+                "codesign",
+                "--force",
+                "--timestamp",
+                "--options",
+                "runtime",
+                "--entitlements",
+                ROOT / "mac" / "app.entitlements.plist",
+                "--sign",
+                args.sign_identity,
+                bundle,
+            )
+        else:
+            run("codesign", "--force", "--deep", "--sign", "-", bundle)
+        run("codesign", "--verify", "--deep", "--strict", bundle)
         # Keep the last built app recoverable while replacing it.
         if destination.exists():
             backup = destination.with_name(f"CD Rip.previous-{time.time_ns()}.app")

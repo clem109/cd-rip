@@ -1,6 +1,8 @@
 include CONTRIBUTING.md
 include PRIVACY.md
+include LICENSE
+include THIRD_PARTY.md
+recursive-include mac *.plist
 recursive-include docs/images *.png
 recursive-include docs *.md
-include docs/ci.yml
 recursive-include mac *.py *.swift

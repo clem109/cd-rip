@@ -56,3 +56,6 @@ duration and audio format, not bit-perfect identity. Read correction uses
 
 Artwork, lyrics and release identification depend on provider coverage. Album artwork
 in the screenshot belongs to its respective rights holders.
+
+Code is licensed under [GPL-3.0-or-later](LICENSE). Third-party artwork and retrieved
+metadata are not relicensed by this project. See [dependency notices](THIRD_PARTY.md).

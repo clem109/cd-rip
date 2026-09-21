@@ -5,7 +5,7 @@ The personal build is ad-hoc signed; it is not a consumer-ready installer.
 
 ## Before publishing an app download
 
-- Select a project license and include all dependency licenses and notices.
+- The project uses GPL-3.0-or-later. Builds include dependency notices and runtime versions.
 - Supply corresponding source where required for bundled GPL components. Mutagen is
   GPL-2.0-or-later. Python and the PyInstaller bootloader have separate license terms;
   review the complete frozen dependency inventory before shipping it.
@@ -22,8 +22,37 @@ The personal build is ad-hoc signed; it is not a consumer-ready installer.
 - Test a clean install, folder and Music permissions, every format, errors, restart,
   incomplete-rip recovery and Music import using a real CD drive. Automated tests use
   generated audio; they are not a substitute for drive compatibility testing.
-- Enable the CI template in `docs/ci.yml` with GitHub credentials that can update
-  workflows. CI is not currently enabled.
+- CI is enabled in `.github/workflows/ci.yml`: two Python versions, lint, tests,
+  source/wheel packaging, and a native app build. Unsigned app bundles are not published.
+
+## Signed release workflow
+
+`mac/release.py` requires a **Developer ID Application** certificate with its private key
+installed in your login Keychain, and an existing `notarytool` Keychain profile. Create
+these through your Apple Developer account; don't put certificates, passwords or API keys
+in the repo or in chat. Apple Developer enrollment/agreements must be handled by the owner.
+
+Once those are configured, with a clean committed checkout:
+
+```sh
+.venv/bin/python mac/release.py \
+  --identity 'Developer ID Application: Your Name (TEAMID)' \
+  --notary-profile 'cd-rip-notary'
+```
+
+The script signs the native app and frozen engine with hardened runtime, prepares source
+archives, submits to Apple, requires an Accepted response, staples and validates the ticket,
+and runs Gatekeeper verification. Only after success does it create a versioned directory
+under `dist/` with the app ZIP, matching source archive, and SHA-256 checksums. It never
+publishes to GitHub automatically. Publish both archives together after clean-Mac testing.
+
+The app requests Apple-events permission for Music. Only the helper has the
+disable-library-validation entitlement because it loads separately installed Homebrew
+libdiscid. No system security setting is changed. External tools still require Homebrew.
+
+Signing/notarization cannot be exercised without those Apple credentials; script preflight
+and rejection handling are covered by local tests, but an accepted notarization is required
+before calling a download release-ready.
 
 See Apple's [distribution-signing guide](https://developer.apple.com/documentation/xcode/creating-distribution-signed-code-for-the-mac/)
 and [notarization guide](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution).

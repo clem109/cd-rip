@@ -18,6 +18,8 @@ command share the same entry point. Runtime data stays outside the installed pac
 
 Do not commit audio, artwork, lyrics, job files, logs, or virtual environments.
 
-`docs/ci.yml` is a GitHub Actions template for macOS checks on Python 3.11 and 3.14.
-To enable it, move it to `.github/workflows/ci.yml` and push using credentials with
-permission to update workflows.
+`.github/workflows/ci.yml` runs macOS checks on Python 3.11 and 3.14 and verifies a
+native app build. Actions are pinned to immutable commits; PR jobs have read-only access.
+
+For Developer ID signing and notarization, see [Distribution](docs/distribution.md).
+Contributions are made under the project's GPL-3.0-or-later license.

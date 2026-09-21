@@ -7,6 +7,8 @@ name = "cd-rip"
 dynamic = ["version"]
 description = "A native macOS CD ripper with ALAC, AAC, FLAC, WAV, artwork, lyrics, and Music import."
 readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 authors = [{name = "Clement Venard"}]
 dependencies = ["mutagen>=1.47,<2"]
