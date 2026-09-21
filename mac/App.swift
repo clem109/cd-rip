@@ -230,7 +230,7 @@ final class Ripper: ObservableObject {
             case "enriching":
                 partial = nil; fraction = 1
                 phase = "Adding the finishing touches"
-                detail = "The CD is ready. Fetching artwork and lyrics."
+                detail = "Finishing artwork and lyrics, then adding to Music."
             case "attention": fail(event["message"] as? String ?? "Check the activity log.")
             case "complete":
                 partial = nil; fraction = 1

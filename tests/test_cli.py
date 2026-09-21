@@ -8,6 +8,7 @@ import plistlib
 import struct
 import subprocess
 import tempfile
+import threading
 import unittest
 import wave
 from pathlib import Path
@@ -150,9 +151,13 @@ class Tests(unittest.TestCase):
     def test_full_pipeline_with_fake_drive_and_network(self):
         real_run = app.run
         events = []
+        fetching = threading.Event()
+        extracting = threading.Event()
 
         def fake_run(args, **kwargs):
             if args[0] == "cd-paranoia":
+                extracting.set()
+                self.assertTrue(fetching.wait(3), "Metadata should start during extraction")
                 events.append("extract")
                 make_wav(args[-1])
                 return Mock(returncode=0)
@@ -165,6 +170,8 @@ class Tests(unittest.TestCase):
             return real_run(args, **kwargs)
 
         def response(url, binary=False):
+            fetching.set()
+            self.assertTrue(extracting.wait(3), "Extraction must not wait for metadata")
             return (
                 PNG
                 if binary
@@ -189,6 +196,12 @@ class Tests(unittest.TestCase):
         self.assertTrue(job["files"][0]["imported"])
         self.assertEqual(job["warnings"], [])
         self.assertTrue((self.folder / TOC["id"] / "01.lrc").exists())
+        tags = MP4(self.folder / TOC["id"] / job["files"][0]["name"])
+        self.assertEqual(tags["\xa9lyr"], ["Test lyrics"])
+        self.assertEqual(bytes(tags["covr"][0]), PNG)
+        self.assertEqual(
+            app.digest(self.folder / TOC["id"] / job["files"][0]["name"]), job["files"][0]["sha256"]
+        )
 
     def test_read_failure_never_ejects_or_imports(self):
         args = argparse.Namespace(
@@ -204,6 +217,7 @@ class Tests(unittest.TestCase):
             patch.object(app, "audio_devices", return_value={"/dev/disk5"}),
             patch.object(app, "read_toc", return_value=TOC),
             patch.object(app, "identify", return_value=META),
+            patch.object(app.Client, "get", return_value=None),
             patch.object(app, "run", side_effect=fail) as run,
             patch.object(app.subprocess, "run") as mount,
         ):
@@ -213,6 +227,29 @@ class Tests(unittest.TestCase):
             any(c.args[0][0] == "osascript" or "eject" in c.args[0] for c in run.call_args_list)
         )
         self.assertEqual(mount.call_args.args[0], ["diskutil", "mountDisk", "/dev/disk5"])
+
+    def test_prefetch_does_not_mutate_manifest_or_require_audio(self):
+        job = {"metadata": copy.deepcopy(META), "toc": copy.deepcopy(TOC), "files": []}
+        before = copy.deepcopy(job)
+        client = Mock()
+        client.get.return_value = PNG
+        cover, lyrics, warnings = app.fetch_enrichment(client, self.folder, job, False)
+        self.assertEqual(cover, PNG)
+        self.assertEqual(lyrics, [None])
+        self.assertEqual(warnings, [])
+        self.assertEqual(job, before)
+        self.assertFalse((self.folder / "job.json").exists())
+        client.get.assert_called_once()
+
+    def test_prefetch_network_failure_returns_notices(self):
+        job = {"metadata": META, "toc": TOC, "files": []}
+        client = Mock()
+        client.get.side_effect = TimeoutError("offline")
+        cover, lyrics, warnings = app.fetch_enrichment(client, self.folder, job)
+        self.assertIsNone(cover)
+        self.assertEqual(lyrics, [None])
+        self.assertTrue(any("Artwork" in warning for warning in warnings))
+        self.assertTrue(any("Lyrics" in warning for warning in warnings))
 
     def test_path_escape_rejected(self):
         app.save(self.folder / "job.json", {"files": [{"name": "../outside.m4a"}]})

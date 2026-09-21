@@ -28,6 +28,9 @@ licensing/source notices, Developer ID signing, and notarization.
    already in the drive; don't use it while another app is ripping.
 4. Pick the matching edition when prompted. Completed albums are added to Music by default.
 
+Artwork and lyrics download in the background during extraction. Artwork appears as soon
+as it is available. Tags are embedded after audio verification and before Music import.
+
 **Stop after this CD** completes the current extraction, tagging, and import before stopping.
 Quitting while active uses the same graceful stop. It can take time if a disc or metadata
 provider is slow. Closing the window alone does not stop work.

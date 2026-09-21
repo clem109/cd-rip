@@ -2,6 +2,7 @@
 """Local macOS CD -> ALAC pipeline. No hardware access until watch/rip is invoked."""
 
 import argparse
+import copy
 import ctypes as C
 import ctypes.util
 import fcntl
@@ -19,6 +20,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import __version__
@@ -34,11 +36,13 @@ UA = f"cd-rip/{__version__} (https://github.com/clem109/cd-rip)"
 GUI = os.environ.get("CD_RIP_GUI") == "1"
 STOP = threading.Event()
 CHOICES = queue.Queue()
+OUTPUT_LOCK = threading.Lock()
 
 
 def event(kind, **values):
     if GUI:
-        print(json.dumps({"event": kind, **values}), flush=True)
+        with OUTPUT_LOCK:
+            print(json.dumps({"event": kind, **values}), flush=True)
 
 
 def read_controls():
@@ -380,7 +384,8 @@ def tag_file(path, metadata, index, cover=None, lyrics=None):
     audio.save()
 
 
-def enrich(client, folder, job, lyrics_enabled=True):
+def fetch_enrichment(client, folder, job, lyrics_enabled=True, cancel=None):
+    """Fetch sidecars only: never touch audio files or the shared job manifest."""
     meta = job["metadata"]
     warnings = []
     cover_path = folder / "cover.jpg"
@@ -390,6 +395,8 @@ def enrich(client, folder, job, lyrics_enabled=True):
             ("release", meta["release_id"]),
             ("release-group", meta.get("release_group")),
         ]:
+            if cancel is not None and cancel.is_set():
+                break
             if not ident:
                 continue
             try:
@@ -406,8 +413,10 @@ def enrich(client, folder, job, lyrics_enabled=True):
                 warnings.append(f"Artwork lookup: {exc}")
     if not cover:
         warnings.append("Artwork missing (retry later or place your own JPEG at cover.jpg)")
-    for index, entry in enumerate(job["files"]):
-        track = meta["tracks"][index]
+    lyrics_by_track = []
+    for index, track in enumerate(meta["tracks"]):
+        if cancel is not None and cancel.is_set():
+            break
         lyrics = None
         txt = folder / f"{index + 1:02}.lyrics.txt"
         if txt.exists():
@@ -433,6 +442,17 @@ def enrich(client, folder, job, lyrics_enabled=True):
                     warnings.append(f"Lyrics missing: {track['title']}")
             except Exception as exc:
                 warnings.append(f"Lyrics {track['title']}: {exc}")
+        lyrics_by_track.append(lyrics)
+    return cover, lyrics_by_track, warnings
+
+
+def enrich(client, folder, job, lyrics_enabled=True, fetched=None):
+    cover, lyrics_by_track, warnings = (
+        fetched if fetched is not None else fetch_enrichment(client, folder, job, lyrics_enabled)
+    )
+    meta = job["metadata"]
+    for index, entry in enumerate(job["files"]):
+        lyrics = lyrics_by_track[index]
         target = folder / entry["name"]
         tag_file(target, meta, index, cover, lyrics)
         entry["sha256"] = digest(target)
@@ -540,6 +560,12 @@ def process_disc(device, args):
     if read_toc(device) != toc:
         raise RuntimeError("Disc changed during identification; refusing to rip")
     run(["diskutil", "unmountDisk", device], capture_output=True, timeout=30)
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="metadata")
+    cancel_metadata = threading.Event()
+    say("Fetching artwork and lyrics in the background…")
+    metadata = pool.submit(
+        fetch_enrichment, Client(), folder, copy.deepcopy(job), not args.no_lyrics, cancel_metadata
+    )
     try:
         for index, track in enumerate(toc["tracks"]):
             if index < len(job["files"]):
@@ -596,17 +622,25 @@ def process_disc(device, args):
         save(jobfile, job)
     except BaseException:
         # Make the disc visible again after failure/Control-C; never eject on read failure.
-        subprocess.run(["diskutil", "mountDisk", device], capture_output=True, timeout=30)
+        cancel_metadata.set()
+        try:
+            subprocess.run(["diskutil", "mountDisk", device], capture_output=True, timeout=30)
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
         raise
-    if not args.no_eject:
-        run(["diskutil", "eject", device], capture_output=True, timeout=30)
-        say("Audio saved and checked; CD ejected.")
-    else:
-        run(["diskutil", "mountDisk", device], capture_output=True, timeout=30)
-    say("Fetching artwork and lyrics…")
-    event("enriching", folder=str(folder))
     try:
-        enrich(client, folder, job, not args.no_lyrics)
+        if not args.no_eject:
+            run(["diskutil", "eject", device], capture_output=True, timeout=30)
+            say("Audio saved and checked; CD ejected.")
+        else:
+            run(["diskutil", "mountDisk", device], capture_output=True, timeout=30)
+    finally:
+        # The drive is released before waiting for any remaining network requests.
+        event("enriching", folder=str(folder))
+        pool.shutdown(wait=True)
+    say("Embedding artwork and lyrics…")
+    try:
+        enrich(client, folder, job, not args.no_lyrics, fetched=metadata.result())
         if not args.no_music:
             import_music(folder, job)
     except Exception as exc:
