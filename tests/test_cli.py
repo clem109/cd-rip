@@ -3,6 +3,7 @@
 import argparse
 import base64
 import copy
+import io
 import plistlib
 import struct
 import subprocess
@@ -85,6 +86,24 @@ class Tests(unittest.TestCase):
         }
         with self.assertRaises(ValueError):
             app.metadata_from_release(release, TOC)
+
+    def test_edition_details_are_preserved_for_picker(self):
+        release = {
+            "id": META["release_id"],
+            "title": "Test Album",
+            "country": "GB",
+            "date": "1995-10-02",
+            "disambiguation": "original pressing",
+            "label-info": [{"label": {"name": "Creation"}, "catalog-number": "CRE CD 189"}],
+            "media": [
+                {"discs": [{"id": TOC["id"]}], "tracks": [{"title": "Test Track", "length": 1000}]}
+            ],
+        }
+        metadata = app.metadata_from_release(release, TOC)
+        self.assertEqual(metadata["country"], "GB")
+        self.assertEqual(metadata["label"], "Creation")
+        self.assertEqual(metadata["catalogue"], "CRE CD 189")
+        self.assertEqual(metadata["disambiguation"], "original pressing")
 
     def test_import_success_skip_and_uncertain_failure(self):
         job = {"metadata": META, "files": [{"name": "test.m4a"}]}
@@ -199,6 +218,84 @@ class Tests(unittest.TestCase):
         app.save(self.folder / "job.json", {"files": [{"name": "../outside.m4a"}]})
         with self.assertRaises(ValueError):
             app.load_job(self.folder)
+
+    def test_gui_controls_select_and_request_graceful_stop(self):
+        import queue
+        import threading
+
+        stop, choices = threading.Event(), queue.Queue()
+        stream = io.StringIO('invalid\n[]\n{"command":"choose","choice":2}\n{"command":"stop"}\n')
+        with (
+            patch.object(app.sys, "stdin", stream),
+            patch.object(app, "STOP", stop),
+            patch.object(app, "CHOICES", choices),
+        ):
+            app.read_controls()
+        self.assertEqual(choices.get_nowait(), "2")
+        self.assertTrue(stop.is_set())
+
+    def test_gui_messages_are_machine_readable(self):
+        import json
+
+        output = io.StringIO()
+        with patch.object(app, "GUI", True), patch.object(app.sys, "stdout", output):
+            app.say('Album "test"\nnext line')
+        self.assertEqual(
+            json.loads(output.getvalue()), {"event": "log", "message": 'Album "test"\nnext line'}
+        )
+
+    def test_gui_edition_choice_works_without_terminal(self):
+        import queue
+
+        choices = queue.Queue()
+        choices.put("2")
+        client = Mock()
+        client.get.return_value = {"releases": [{"id": "one"}, {"id": "two"}]}
+        first, second = dict(META, date="1986"), dict(META, date="1993")
+        with (
+            patch.object(app, "GUI", True),
+            patch.object(app, "CHOICES", choices),
+            patch.object(app, "metadata_from_release", side_effect=[first, second]),
+            patch.object(app, "event") as event,
+        ):
+            self.assertEqual(app.identify(client, TOC), second)
+        self.assertTrue(any(call.args[0] == "choices" for call in event.call_args_list))
+
+    def test_watcher_stops_after_current_job(self):
+        import threading
+
+        stop = threading.Event()
+
+        def complete_current(*args):
+            stop.set()
+            return True
+
+        with (
+            patch.object(app, "STOP", stop),
+            patch.object(app, "audio_devices", side_effect=[set(), {"/dev/disk5", "/dev/disk6"}]),
+            patch.object(app, "process_disc", side_effect=complete_current) as process,
+            patch.object(app.time, "sleep"),
+        ):
+            app.watch(Mock())
+        process.assert_called_once()
+
+    def test_stop_before_rip_leaves_drive_alone(self):
+        import threading
+
+        stop = threading.Event()
+        stop.set()
+        args = argparse.Namespace(
+            output=self.folder, release=None, no_music=False, no_eject=False, no_lyrics=False
+        )
+        with (
+            patch.object(app, "audio_devices", return_value={"/dev/disk5"}),
+            patch.object(app, "read_toc", return_value=TOC),
+            patch.object(app, "identify", return_value=META),
+            patch.object(app, "STOP", stop),
+            patch.object(app, "run") as run,
+        ):
+            self.assertFalse(app.process_disc("/dev/disk5", args))
+            run.assert_not_called()
 
 
 if __name__ == "__main__":

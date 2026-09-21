@@ -1,3 +1,4 @@
 include CONTRIBUTING.md
 recursive-include docs *.md
 include docs/ci.yml
+recursive-include mac *.py *.swift

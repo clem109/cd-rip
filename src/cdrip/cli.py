@@ -9,10 +9,12 @@ import hashlib
 import json
 import os
 import plistlib
+import queue
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -29,10 +31,40 @@ STATE_DIR = Path(
 )
 MB = "https://musicbrainz.org/ws/2"
 UA = f"cd-rip/{__version__} (https://github.com/clem109/cd-rip)"
+GUI = os.environ.get("CD_RIP_GUI") == "1"
+STOP = threading.Event()
+CHOICES = queue.Queue()
+
+
+def event(kind, **values):
+    if GUI:
+        print(json.dumps({"event": kind, **values}), flush=True)
+
+
+def read_controls():
+    """The app sends newline-delimited JSON on stdin; no shell commands."""
+    for line in sys.stdin:
+        try:
+            message = json.loads(line)
+            if not isinstance(message, dict):
+                continue
+            if message.get("command") == "stop":
+                STOP.set()
+                CHOICES.put("")
+            elif message.get("command") == "choose":
+                CHOICES.put(str(message.get("choice", "")))
+        except (ValueError, TypeError):
+            continue
+    # If the app exits unexpectedly, finish the current disc, then stop.
+    STOP.set()
+    CHOICES.put("")
 
 
 def say(message):
-    print(message, flush=True)
+    if GUI:
+        event("log", message=message)
+    else:
+        print(message, flush=True)
 
 
 def run(args, **kwargs):
@@ -58,6 +90,7 @@ def digest(path):
 
 def libdiscid():
     candidates = [
+        str(Path(getattr(sys, "_MEIPASS", "/nonexistent")) / "libdiscid.dylib"),
         "/opt/homebrew/lib/libdiscid.dylib",
         "/usr/local/lib/libdiscid.dylib",
         ctypes.util.find_library("discid"),
@@ -196,6 +229,14 @@ def metadata_from_release(release, toc, require_id=True):
             "album": release["title"],
             "artist": artist(release.get("artist-credit")),
             "date": release.get("date", ""),
+            "country": release.get("country", ""),
+            "disambiguation": release.get("disambiguation", ""),
+            "label": ", ".join(
+                info.get("label", {}).get("name", "") for info in release.get("label-info", [])
+            ),
+            "catalogue": ", ".join(
+                info.get("catalog-number", "") for info in release.get("label-info", [])
+            ),
             "disc": medium.get("position", 1),
             "disc_total": len(release["media"]),
             "tracks": [
@@ -218,13 +259,13 @@ def identify(client, toc, release_id=None):
         if not re.fullmatch(r"[0-9a-fA-F-]{36}", release_id):
             raise ValueError("Use a MusicBrainz release UUID, not a URL")
         result = client.get(
-            f"{MB}/release/{release_id}?inc=recordings+artist-credits+discids+release-groups&fmt=json"
+            f"{MB}/release/{release_id}?inc=recordings+artist-credits+discids+release-groups+labels&fmt=json"
         )
         if not result:
             raise ValueError("Release not found")
         return metadata_from_release(result, toc, require_id=False)
     result = client.get(
-        f"{MB}/discid/{toc['id']}?inc=recordings+artist-credits+release-groups&fmt=json"
+        f"{MB}/discid/{toc['id']}?inc=recordings+artist-credits+release-groups+labels&fmt=json"
     )
     candidates = []
     for release in (result or {}).get("releases", []):
@@ -239,10 +280,14 @@ def identify(client, toc, release_id=None):
     say("Multiple matching editions:")
     for i, m in enumerate(candidates, 1):
         say(f"  {i}. {m['artist']} — {m['album']} ({m['date']}) [{m['release_id']}]")
-    if not sys.stdin.isatty():
+    if GUI:
+        event("choices", releases=candidates)
+        choice = CHOICES.get()
+    elif not sys.stdin.isatty():
         say("No interactive terminal: ripping with placeholder tags; resolve later with --release.")
         return None
-    choice = input("Edition number (Enter = identify later): ").strip()
+    else:
+        choice = input("Edition number (Enter = identify later): ").strip()
     if not choice:
         return None
     if not choice.isdigit() or not 1 <= int(choice) <= len(candidates):
@@ -487,6 +532,10 @@ def process_disc(device, args):
         )
         return
     say(f"Found: {job['metadata']['artist']} — {job['metadata']['album']}")
+    event("album", metadata=job["metadata"], folder=str(folder))
+    if STOP.is_set():
+        say("Stopped before extraction; the disc was left inserted.")
+        return False
     # Normal (non-force) unmount: an app holding the disc can prevent this.
     if read_toc(device) != toc:
         raise RuntimeError("Disc changed during identification; refusing to rip")
@@ -509,6 +558,14 @@ def process_disc(device, args):
                 raise RuntimeError(
                     f"Unrecorded file exists: {target}. Move it aside before resuming."
                 )
+            event(
+                "track",
+                number=index + 1,
+                total=len(toc["tracks"]),
+                title=job["metadata"]["tracks"][index]["title"],
+                partial=str(wav),
+                expected=track["sectors"] * 2352,
+            )
             # -X aborts on unrecoverable skips, instead of accepting damaged audio.
             with (folder / f"{index + 1:02}.rip.log").open("ab") as log:
                 run(
@@ -547,6 +604,7 @@ def process_disc(device, args):
     else:
         run(["diskutil", "mountDisk", device], capture_output=True, timeout=30)
     say("Fetching artwork and lyrics…")
+    event("enriching", folder=str(folder))
     try:
         enrich(client, folder, job, not args.no_lyrics)
         if not args.no_music:
@@ -554,17 +612,28 @@ def process_disc(device, args):
     except Exception as exc:
         say(f"Audio safe; post-processing needs attention: {exc}")
         say(f"Use retry-metadata or import-music with: {folder}")
+        event("attention", message=str(exc))
     say(f"Saved: {folder}")
+    event(
+        "complete",
+        folder=str(folder),
+        warnings=job.get("warnings", []),
+        imported=sum(bool(item.get("imported")) for item in job["files"]),
+        total=len(job["files"]),
+    )
     return not args.no_eject
 
 
 def watch(args):
     seen = audio_devices()
     say("Waiting for a NEW CD. Any disc currently inserted is ignored. Ctrl-C stops.")
-    while True:
+    event("waiting")
+    while not STOP.is_set():
         devices = audio_devices()
         seen.intersection_update(devices)
         for device in sorted(devices - seen):
+            if STOP.is_set():
+                break
             seen.add(device)  # Failures never trigger an endless automatic retry.
             try:
                 if process_disc(device, args):
@@ -574,6 +643,8 @@ def watch(args):
                 say(
                     f"Needs attention ({device}): {exc}. Reinsert after resolving, or use rip explicitly."
                 )
+                event("attention", message=str(exc))
+            event("waiting")
         time.sleep(3)
 
 
@@ -630,6 +701,8 @@ def main():
     p.add_argument("album", type=Path)
     p.add_argument("--retry-uncertain", action="store_true")
     args = parser.parse_args()
+    if GUI:
+        threading.Thread(target=read_controls, daemon=True).start()
     if args.command == "status":
         status(args.output.expanduser().resolve())
         return
@@ -644,6 +717,18 @@ def main():
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise RuntimeError("Another cd-rip command is running")
+        # Also respect a running copy of the pre-package CLI on this machine.
+        legacy_lock = None
+        legacy_path = os.environ.get("CD_RIP_LEGACY_LOCK")
+        if legacy_path and Path(legacy_path).exists():
+            legacy_lock = open(legacy_path, "a")
+            try:
+                fcntl.flock(legacy_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                legacy_lock.close()
+                raise RuntimeError(
+                    "The previous CLI is still ripping. Let it finish before starting the app."
+                ) from None
         if args.command in ("retry-metadata", "import-music"):
             folder = args.album.expanduser().resolve()
             job = load_job(folder)

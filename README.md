@@ -21,6 +21,9 @@ Open a new terminal after `pipx ensurepath` if `cd-rip` is not found.
 
 ## Run
 
+Prefer a Mac app? [Build CD Rip.app](docs/mac-app.md) for a menu-bar interface with
+progress, edition selection, and a stop-after-this-CD control.
+
 In Music, set **Settings → General → When a CD is inserted → Show CD**.
 
 ```sh
