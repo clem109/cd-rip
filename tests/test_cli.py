@@ -126,6 +126,41 @@ class Tests(unittest.TestCase):
             app.import_music(self.folder, {"metadata": app.unknown(TOC), "files": []})
             run.assert_not_called()
 
+    def test_gui_import_uses_native_app_and_requires_confirmation(self):
+        import queue
+
+        results = queue.Queue()
+        path = str((self.folder / "test.m4a").resolve())
+        results.put({"path": path, "ok": True})
+        job = {"metadata": META, "files": [{"name": "test.m4a"}]}
+        with (
+            patch.object(app, "GUI", True),
+            patch.object(app, "IMPORT_RESULTS", results),
+            patch.object(app, "event") as event,
+            patch.object(app, "run") as run,
+        ):
+            app.import_music(self.folder, job)
+        run.assert_not_called()
+        self.assertTrue(job["files"][0]["imported"])
+        self.assertTrue(any(c.args[0] == "import_request" for c in event.call_args_list))
+
+    def test_gui_import_failure_keeps_uncertain_track_pending(self):
+        import queue
+
+        results = queue.Queue()
+        path = str((self.folder / "test.m4a").resolve())
+        results.put({"path": path, "ok": False, "error": "Automation permission denied"})
+        job = {"metadata": META, "files": [{"name": "test.m4a"}]}
+        with (
+            patch.object(app, "GUI", True),
+            patch.object(app, "IMPORT_RESULTS", results),
+            patch.object(app, "event"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "permission denied"):
+                app.import_music(self.folder, job)
+        self.assertTrue(job["files"][0]["import_pending"])
+        self.assertFalse(job["files"][0].get("imported"))
+
     def test_watcher_ignores_current_then_processes_reinserted_cd(self):
         sequence = [{"/dev/disk5"}, {"/dev/disk5"}, set(), {"/dev/disk5"}]
         with (
@@ -240,6 +275,35 @@ class Tests(unittest.TestCase):
         self.assertEqual(job, before)
         self.assertFalse((self.folder / "job.json").exists())
         client.get.assert_called_once()
+
+    def test_postprocessing_error_is_saved_and_included_in_completion(self):
+        args = argparse.Namespace(
+            output=self.folder, release=None, no_music=False, no_eject=False, no_lyrics=False
+        )
+        real_run = app.run
+
+        def fake_run(command, **kwargs):
+            if command[0] == "cd-paranoia":
+                make_wav(command[-1])
+                return Mock()
+            if command[0] == "diskutil":
+                return Mock()
+            return real_run(command, **kwargs)
+
+        with (
+            patch.object(app, "audio_devices", return_value={"/dev/disk5"}),
+            patch.object(app, "read_toc", return_value=TOC),
+            patch.object(app, "identify", return_value=META),
+            patch.object(app, "fetch_enrichment", return_value=(None, [None], [])),
+            patch.object(app, "run", side_effect=fake_run),
+            patch.object(app, "import_music", side_effect=RuntimeError("Music unavailable")),
+            patch.object(app, "event") as event,
+        ):
+            app.process_disc("/dev/disk5", args)
+        job = app.load_job(self.folder / TOC["id"])
+        self.assertEqual(job["postprocess_error"], "Music unavailable")
+        completion = next(c for c in event.call_args_list if c.args[0] == "complete")
+        self.assertEqual(completion.kwargs["error"], "Music unavailable")
 
     def test_prefetch_network_failure_returns_notices(self):
         job = {"metadata": META, "toc": TOC, "files": []}

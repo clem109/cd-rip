@@ -43,5 +43,8 @@ The app remembers its archive preference. A local build detects a pre-existing `
 folder and uses it initially; otherwise the default is `~/Music/CD Rip/`.
 Only one packaged ripper can run at a time. Local builds also respect the original CLI lock.
 
-The first Music import may prompt for Automation permission. Check setup never reads a CD
+The native app handles Music imports and may prompt for Automation permission. Each track
+is marked imported only after Music confirms it. Import failures remain visible as **Needs
+attention** and are saved in the album's job record; uncertain imports are not blindly retried.
+Check setup never reads a CD
 or controls Music. Edition prompts use JSON messages over pipes, not Terminal interaction.

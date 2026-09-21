@@ -184,6 +184,35 @@ final class Ripper: ObservableObject {
         phase = "Identifying album…"
     }
 
+    func importTrack(_ path: String) {
+        let escaped = path.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\r", with: "\\r")
+        let source = """
+        set audioFile to POSIX file "\(escaped)" as alias
+        with timeout of 300 seconds
+            tell application "Music"
+                activate
+                set addedTrack to add audioFile
+                return persistent ID of addedTrack
+            end tell
+        end timeout
+        """
+        DispatchQueue.global(qos: .userInitiated).async {
+            var error: NSDictionary?
+            let script = NSAppleScript(source: source)
+            let result = script?.executeAndReturnError(&error)
+            let ok = error == nil && !(result?.stringValue ?? "").isEmpty
+            let message = error?[NSAppleScript.errorMessage] as? String
+                ?? "Music did not confirm the import. Check Music before retrying."
+            DispatchQueue.main.async {
+                self.send(["command": "import_result", "path": path, "ok": ok,
+                           "error": ok ? "" : message])
+            }
+        }
+    }
+
     func receive(_ data: Data) {
         lineBuffer.append(data)
         while let newline = lineBuffer.firstIndex(of: 10) {
@@ -232,8 +261,18 @@ final class Ripper: ObservableObject {
                 phase = "Adding the finishing touches"
                 detail = "Finishing artwork and lyrics, then adding to Music."
             case "attention": fail(event["message"] as? String ?? "Check the activity log.")
+            case "importing":
+                phase = "Adding to Music"
+                detail = event["name"] as? String ?? "Check for an Automation permission prompt."
+            case "import_request":
+                if let path = event["path"] as? String { importTrack(path) }
             case "complete":
                 partial = nil; fraction = 1
+                if let error = event["error"] as? String {
+                    fail(error)
+                    break
+                }
+                if phase == "Needs attention" { break }
                 let warnings = event["warnings"] as? [String] ?? []
                 let imported = event["imported"] as? Int ?? 0
                 phase = "Album saved"

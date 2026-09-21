@@ -36,6 +36,7 @@ UA = f"cd-rip/{__version__} (https://github.com/clem109/cd-rip)"
 GUI = os.environ.get("CD_RIP_GUI") == "1"
 STOP = threading.Event()
 CHOICES = queue.Queue()
+IMPORT_RESULTS = queue.Queue()
 OUTPUT_LOCK = threading.Lock()
 
 
@@ -57,6 +58,8 @@ def read_controls():
                 CHOICES.put("")
             elif message.get("command") == "choose":
                 CHOICES.put(str(message.get("choice", "")))
+            elif message.get("command") == "import_result":
+                IMPORT_RESULTS.put(message)
         except (ValueError, TypeError):
             continue
     # If the app exits unexpectedly, finish the current disc, then stop.
@@ -487,17 +490,34 @@ def import_music(folder, job, retry_uncertain=False):
             )
         entry["import_pending"] = True
         save(folder / "job.json", job)
-        run(
-            ["osascript", "-", str((folder / entry["name"]).resolve())],
-            input=IMPORT_SCRIPT,
-            text=True,
-            capture_output=True,
-            timeout=120,
-        )
+        path = str((folder / entry["name"]).resolve())
+        event("importing", name=entry["name"])
+        try:
+            if GUI:
+                # The native app owns Automation permission, not its frozen Python helper.
+                event("import_request", path=path)
+                result = IMPORT_RESULTS.get(timeout=330)
+                if result.get("path") != path or not result.get("ok"):
+                    raise RuntimeError(result.get("error") or "Music did not confirm this track")
+            else:
+                run(
+                    ["osascript", "-", path],
+                    input=IMPORT_SCRIPT,
+                    text=True,
+                    capture_output=True,
+                    timeout=120,
+                )
+        except (subprocess.TimeoutExpired, queue.Empty) as exc:
+            raise RuntimeError(
+                "Music import timed out. Your audio is safe. Check Music and any permission "
+                "prompt before retrying; this track may already have been added."
+            ) from exc
         entry["imported"] = True
         entry["import_pending"] = False
         save(folder / "job.json", job)
     say("Added to Music ✓")
+    job.pop("postprocess_error", None)
+    save(folder / "job.json", job)
 
 
 def load_job(folder):
@@ -644,12 +664,15 @@ def process_disc(device, args):
         if not args.no_music:
             import_music(folder, job)
     except Exception as exc:
+        job["postprocess_error"] = str(exc)
+        save(jobfile, job)
         say(f"Audio safe; post-processing needs attention: {exc}")
         say(f"Use retry-metadata or import-music with: {folder}")
         event("attention", message=str(exc))
     say(f"Saved: {folder}")
     event(
         "complete",
+        error=job.get("postprocess_error"),
         folder=str(folder),
         warnings=job.get("warnings", []),
         imported=sum(bool(item.get("imported")) for item in job["files"]),
