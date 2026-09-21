@@ -3,6 +3,11 @@
 CD Rip.app is a native SwiftUI window with a menu-bar icon. It bundles the Python
 engine and starts idle. Closing the window keeps the watcher available in the menu bar.
 
+The resizable album view shows artwork, edition details, track durations, lyrics availability,
+per-track status and extraction progress. It restores the most recently saved album when
+opened. Toolbar buttons open the archive, activity log and settings; rip controls stay below
+the track list. Progress measures audio extraction, while Music import has its own status.
+
 ## Build
 
 Requires macOS 13+, Xcode Command Line Tools, Python 3.11+, and Homebrew.
