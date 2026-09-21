@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.14']
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: brew install ffmpeg libdiscid libcdio-paranoia
+      - run: python -m pip install '.[dev,mac]'
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: python -m unittest discover -s tests -v
+      - run: cd-rip doctor
+      - run: python -m build
+      - name: Build and verify native app (not a release)
+        if: matrix.python-version == '3.14'
+        run: |
+          python mac/build.py
+          codesign --verify --deep --strict 'dist/CD Rip.app'
+          test "$(cat 'dist/CD Rip.app/Contents/Resources/config.json')" = '{}'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: matrix.python-version == '3.14'
+        with:
+          name: source-and-wheel
+          path: |
+            dist/*.tar.gz
+            dist/*.whl
+          retention-days: 14
