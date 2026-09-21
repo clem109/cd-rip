@@ -37,6 +37,10 @@ final class Ripper: ObservableObject {
     @Published var showLog = false
     @Published var addToMusic = true
     @Published var fetchLyrics = true
+    @Published var audioFormat = "alac"
+    @Published var aacBitrate = 256
+    @Published var albumFormat = "Apple Lossless"
+    @Published var albumQuality = "16-bit / 44.1 kHz"
     @Published var output: URL
     var process: Process?
     var input: Pipe?
@@ -59,6 +63,10 @@ final class Ripper: ObservableObject {
                      NSHomeDirectory() + "/Music/CD Rip", isDirectory: true)
         addToMusic = UserDefaults.standard.object(forKey: "music") as? Bool ?? true
         fetchLyrics = UserDefaults.standard.object(forKey: "lyrics") as? Bool ?? true
+        let savedFormat = UserDefaults.standard.string(forKey: "format") ?? "alac"
+        audioFormat = ["alac", "aac", "flac", "wav"].contains(savedFormat) ? savedFormat : "alac"
+        let savedBitrate = UserDefaults.standard.integer(forKey: "aacBitrate")
+        aacBitrate = [128, 192, 256, 320].contains(savedBitrate) ? savedBitrate : 256
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             self?.updateProgress()
         }
@@ -116,6 +124,9 @@ final class Ripper: ObservableObject {
         album = meta["album"] as? String ?? "Unknown album"
         artist = meta["artist"] as? String ?? "Unknown artist"
         audioComplete = job["audio_complete"] as? Bool ?? false
+        let format = job["format"] as? String ?? "alac"
+        albumFormat = ["alac": "Apple Lossless", "aac": "AAC", "flac": "FLAC", "wav": "WAV"][format] ?? format
+        albumQuality = format == "aac" ? "\(job["aac_bitrate"] as? Int ?? 256) kbps / 44.1 kHz" : "16-bit / 44.1 kHz"
         total = titles.count
         releaseDetail = [meta["date"], meta["country"], meta["label"], meta["catalogue"]]
             .compactMap { $0 as? String }.filter { !$0.isEmpty }.joined(separator: " · ")
@@ -140,6 +151,8 @@ final class Ripper: ObservableObject {
         if panel.runModal() == .OK, let url = panel.url {
             output = url
             UserDefaults.standard.set(url.path, forKey: "archive")
+            folder = nil; cover = nil; tracks = []; total = 0; fraction = 0; releaseDetail = ""
+            restoreLatestAlbum()
         }
     }
 
@@ -173,7 +186,8 @@ final class Ripper: ObservableObject {
         child.arguments = [command]
         if command != "doctor" {
             child.arguments! += ["--output", output.path]
-            if !addToMusic { child.arguments!.append("--no-music") }
+            child.arguments! += ["--format", audioFormat, "--aac-bitrate", String(aacBitrate)]
+            if !addToMusic || audioFormat == "flac" { child.arguments!.append("--no-music") }
             if !fetchLyrics { child.arguments!.append("--no-lyrics") }
         }
         var env = ProcessInfo.processInfo.environment
@@ -196,6 +210,8 @@ final class Ripper: ObservableObject {
         detail = checking ? "No drive access is needed." : "Any CD already inserted is left alone in watch mode."
         UserDefaults.standard.set(addToMusic, forKey: "music")
         UserDefaults.standard.set(fetchLyrics, forKey: "lyrics")
+        UserDefaults.standard.set(audioFormat, forKey: "format")
+        UserDefaults.standard.set(aacBitrate, forKey: "aacBitrate")
         stdout.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             if data.isEmpty { handle.readabilityHandler = nil; return }
@@ -345,7 +361,9 @@ final class Ripper: ObservableObject {
                 let warnings = event["warnings"] as? [String] ?? []
                 let imported = event["imported"] as? Int ?? 0
                 phase = "Album saved"
-                detail = "\(imported) tracks added to Music" + (warnings.isEmpty ? "." : " · \(warnings.count) metadata notices in the log.")
+                let importedToMusic = event["music_requested"] as? Bool ?? true
+                detail = (importedToMusic ? "\(imported) tracks added to Music" : "Saved to your archive")
+                    + (warnings.isEmpty ? "." : " · \(warnings.count) metadata notices in the log.")
                 updateProgress()
             default: break
             }
@@ -407,8 +425,8 @@ struct ContentView: View {
                     Text(model.releaseDetail).font(.callout).foregroundStyle(.secondary).lineLimit(2)
                 }
                 HStack(spacing: 14) {
-                    Label("Lossless", systemImage: "waveform")
-                    Text("16-bit / 44.1 kHz")
+                    Label(model.albumFormat, systemImage: "waveform")
+                    Text(model.albumQuality)
                     if !model.tracks.isEmpty { Text("\(model.tracks.count) tracks") }
                 }.font(.caption).foregroundStyle(.secondary).padding(.top, 4)
                 if !model.tracks.isEmpty {
@@ -524,7 +542,30 @@ struct ContentView: View {
             Text("Settings").font(.title2.bold())
             GroupBox {
                 VStack(alignment: .leading, spacing: 16) {
-                    Toggle("Add finished albums to Music", isOn: $model.addToMusic)
+                    Picker("Format", selection: $model.audioFormat) {
+                        Text("Apple Lossless (ALAC)").tag("alac")
+                        Text("AAC").tag("aac")
+                        Text("FLAC").tag("flac")
+                        Text("WAV").tag("wav")
+                    }
+                    if model.audioFormat == "aac" {
+                        Picker("Quality", selection: $model.aacBitrate) {
+                            ForEach([128, 192, 256, 320], id: \.self) { rate in
+                                Text("\(rate) kbps").tag(rate)
+                            }
+                        }
+                        Text("Smaller files using lossy compression.").font(.caption).foregroundStyle(.secondary)
+                    }
+                    if model.audioFormat == "flac" {
+                        Text("FLAC is lossless. Music import is unavailable for this format.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    } else if model.audioFormat == "wav" {
+                        Text("Uncompressed audio. Artwork and lyrics in WAV aren't supported by every player.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Toggle("Add finished albums to Music", isOn: Binding(
+                        get: { model.addToMusic && model.audioFormat != "flac" },
+                        set: { model.addToMusic = $0 })).disabled(model.audioFormat == "flac")
                     Toggle("Fetch available lyrics", isOn: $model.fetchLyrics)
                     Divider()
                     Text("Archive folder").font(.headline)
@@ -543,6 +584,10 @@ struct ContentView: View {
                 Button("Done") { model.showSettings = false }.keyboardShortcut(.defaultAction)
             }
         }.padding(26).frame(width: 460)
+        .onChange(of: model.audioFormat) { UserDefaults.standard.set($0, forKey: "format") }
+        .onChange(of: model.aacBitrate) { UserDefaults.standard.set($0, forKey: "aacBitrate") }
+        .onChange(of: model.addToMusic) { UserDefaults.standard.set($0, forKey: "music") }
+        .onChange(of: model.fetchLyrics) { UserDefaults.standard.set($0, forKey: "lyrics") }
     }
 
     private var activity: some View {

@@ -338,8 +338,17 @@ def pcm_hash(path):
     ).stdout
 
 
-def encode(wav, target):
-    temp = target.with_suffix(".encoding.m4a")
+FORMATS = {
+    "alac": ("m4a", "alac"),
+    "aac": ("m4a", "aac"),
+    "flac": ("flac", "flac"),
+    "wav": ("wav", "pcm_s16le"),
+}
+
+
+def encode(wav, target, audio_format="alac", bitrate=256):
+    extension, codec = FORMATS[audio_format]
+    temp = target.with_suffix(".encoding." + extension)
     run(
         [
             "ffmpeg",
@@ -352,17 +361,39 @@ def encode(wav, target):
             "-map",
             "0:a:0",
             "-c:a",
-            "alac",
+            codec,
+            *(["-b:a", f"{bitrate}k"] if audio_format == "aac" else []),
             temp,
         ],
         timeout=600,
     )
-    if pcm_hash(wav) != pcm_hash(temp):
-        raise RuntimeError("ALAC audio does not match extracted PCM; original WAV retained")
+    if audio_format == "aac":
+        import wave
+
+        with wave.open(str(wav)) as source:
+            duration = source.getnframes() / source.getframerate()
+        info = json.loads(
+            run(
+                ["ffprobe", "-v", "error", "-show_streams", "-of", "json", temp],
+                capture_output=True,
+                timeout=60,
+            ).stdout
+        )["streams"][0]
+        if (
+            int(info["channels"]) != 2
+            or int(info["sample_rate"]) != 44100
+            or abs(float(info["duration"]) - duration) > 0.1
+        ):
+            raise RuntimeError("AAC duration or audio format differs; original WAV retained")
+        run(["ffmpeg", "-v", "error", "-xerror", "-i", temp, "-f", "null", "-"], timeout=600)
+    elif pcm_hash(wav) != pcm_hash(temp):
+        raise RuntimeError("Lossless audio does not match extracted PCM; original WAV retained")
     temp.replace(target)
 
 
 def tag_file(path, metadata, index, cover=None, lyrics=None):
+    if path.suffix.lower() in (".flac", ".wav"):
+        return tag_other_format(path, metadata, index, cover, lyrics)
     from mutagen.mp4 import MP4, MP4Cover
 
     audio = MP4(path)
@@ -384,6 +415,59 @@ def tag_file(path, metadata, index, cover=None, lyrics=None):
         audio["covr"] = [MP4Cover(cover, imageformat=fmt)]
     if lyrics:
         audio["\xa9lyr"] = [lyrics]
+    audio.save()
+
+
+def tag_other_format(path, metadata, index, cover=None, lyrics=None):
+    track = metadata["tracks"][index]
+    mime = "image/png" if cover and cover.startswith(b"\x89PNG") else "image/jpeg"
+    if path.suffix.lower() == ".flac":
+        from mutagen.flac import FLAC, Picture
+
+        audio = FLAC(path)
+        audio.update(
+            {
+                "title": track["title"],
+                "artist": track["artist"],
+                "albumartist": metadata["artist"],
+                "album": metadata["album"],
+                "tracknumber": str(index + 1),
+                "tracktotal": str(len(metadata["tracks"])),
+                "discnumber": str(metadata["disc"]),
+                "disctotal": str(metadata["disc_total"]),
+                "date": metadata.get("date", ""),
+            }
+        )
+        if lyrics:
+            audio["lyrics"] = lyrics
+        if cover:
+            picture = Picture()
+            picture.type, picture.mime, picture.data = 3, mime, cover
+            audio.clear_pictures()
+            audio.add_picture(picture)
+    else:
+        from mutagen.id3 import APIC, TALB, TDRC, TIT2, TPE1, TPE2, TPOS, TRCK, USLT
+        from mutagen.wave import WAVE
+
+        audio = WAVE(path)
+        if audio.tags is None:
+            audio.add_tags()
+        for frame in [
+            TIT2(encoding=3, text=track["title"]),
+            TPE1(encoding=3, text=track["artist"]),
+            TPE2(encoding=3, text=metadata["artist"]),
+            TALB(encoding=3, text=metadata["album"]),
+            TRCK(encoding=3, text=f"{index + 1}/{len(metadata['tracks'])}"),
+            TPOS(encoding=3, text=f"{metadata['disc']}/{metadata['disc_total']}"),
+            TDRC(encoding=3, text=metadata.get("date", "")),
+        ]:
+            audio.tags.add(frame)
+        if cover:
+            audio.tags.delall("APIC")
+            audio.tags.add(APIC(encoding=3, mime=mime, type=3, data=cover))
+        if lyrics:
+            audio.tags.delall("USLT")
+            audio.tags.add(USLT(encoding=3, lang="eng", text=lyrics))
     audio.save()
 
 
@@ -476,6 +560,8 @@ end run
 
 
 def import_music(folder, job, retry_uncertain=False):
+    if job.get("format") == "flac" or any(f["name"].endswith(".flac") for f in job["files"]):
+        raise ValueError("Music does not support FLAC import. Use ALAC or AAC for Music.")
     if not job["metadata"].get("release_id"):
         say(
             "Audio saved; Music import deferred until the album is identified with retry-metadata --release."
@@ -530,7 +616,11 @@ def load_job(folder):
 
 
 def check_dependencies():
-    missing = [x for x in ("ffmpeg", "cd-paranoia", "diskutil", "osascript") if not shutil.which(x)]
+    missing = [
+        x
+        for x in ("ffmpeg", "ffprobe", "cd-paranoia", "diskutil", "osascript")
+        if not shutil.which(x)
+    ]
     libdiscid()  # Loading a library does not read the drive.
     if missing:
         raise RuntimeError("Missing tools: " + ", ".join(missing))
@@ -540,7 +630,14 @@ def process_disc(device, args):
     if device not in audio_devices():
         raise RuntimeError("Selected device is not a mounted audio CD; refusing to access it")
     toc = read_toc(device)
-    folder = args.output / toc["id"]
+    audio_format = getattr(args, "format", "alac")
+    bitrate = getattr(args, "aac_bitrate", 256)
+    suffix = (
+        ""
+        if audio_format == "alac"
+        else "-" + audio_format + (f"-{bitrate}" if audio_format == "aac" else "")
+    )
+    folder = args.output / (toc["id"] + suffix)
     folder.mkdir(parents=True, exist_ok=True)
     jobfile = folder / "job.json"
     client = Client()
@@ -556,7 +653,14 @@ def process_disc(device, args):
                 raise
             say(f"Metadata unavailable: {exc}; saving audio for later identification.")
             meta = None
-        job = {"toc": toc, "metadata": meta or unknown(toc), "files": [], "audio_complete": False}
+        job = {
+            "toc": toc,
+            "metadata": meta or unknown(toc),
+            "files": [],
+            "audio_complete": False,
+            "format": audio_format,
+            "aac_bitrate": bitrate if audio_format == "aac" else None,
+        }
         save(jobfile, job)
     if job.get("audio_complete"):
         for entry in job["files"]:
@@ -598,7 +702,8 @@ def process_disc(device, args):
             )
             wav = folder / f"{index + 1:02}.partial.wav"
             target = (
-                folder / f"{index + 1:02} - {safe(job['metadata']['tracks'][index]['title'])}.m4a"
+                folder
+                / f"{index + 1:02} - {safe(job['metadata']['tracks'][index]['title'])}.{FORMATS[audio_format][0]}"
             )
             if target.exists():
                 raise RuntimeError(
@@ -633,7 +738,7 @@ def process_disc(device, args):
                     raise RuntimeError(
                         "Extracted track length differs from CD TOC; WAV retained for review"
                     )
-            encode(wav, target)
+            encode(wav, target, audio_format, bitrate)
             tag_file(target, job["metadata"], index)
             job["files"].append({"name": target.name, "sha256": digest(target), "imported": False})
             save(jobfile, job)
@@ -661,7 +766,7 @@ def process_disc(device, args):
     say("Embedding artwork and lyrics…")
     try:
         enrich(client, folder, job, not args.no_lyrics, fetched=metadata.result())
-        if not args.no_music:
+        if not args.no_music and audio_format != "flac":
             import_music(folder, job)
     except Exception as exc:
         job["postprocess_error"] = str(exc)
@@ -672,6 +777,7 @@ def process_disc(device, args):
     say(f"Saved: {folder}")
     event(
         "complete",
+        music_requested=not args.no_music and audio_format != "flac",
         error=job.get("postprocess_error"),
         folder=str(folder),
         warnings=job.get("warnings", []),
@@ -740,6 +846,10 @@ def main():
         p.add_argument("--no-music", action="store_true")
         p.add_argument("--no-eject", action="store_true")
         p.add_argument("--no-lyrics", action="store_true")
+        p.add_argument(
+            "--format", choices=FORMATS, default="alac", help="Output codec (default: alac)"
+        )
+        p.add_argument("--aac-bitrate", type=int, choices=(128, 192, 256, 320), default=256)
         p.add_argument("--release", help="MusicBrainz release UUID (for explicit identification)")
         if command == "rip":
             p.add_argument(

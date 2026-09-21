@@ -1,5 +1,13 @@
 # Usage
 
+## Output formats
+
+Use `--format alac|aac|flac|wav` with `rip` or `watch`. ALAC is the default.
+For AAC, choose `--aac-bitrate 128|192|256|320` (default 256).
+FLAC never imports into Music. WAV carries ID3 tags, whose support varies by player.
+Lossless formats undergo PCM identity checks; AAC uses decode and duration validation.
+Different codecs and AAC bitrates use separate archive directories.
+
 ## Storage
 
 The default archive is `~/Music/CD Rip/<disc-id>/`. Each folder contains ALAC tracks,

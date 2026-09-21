@@ -1,5 +1,6 @@
 """Build a local, ad-hoc-signed Mac app. Does not launch it or access a CD."""
 
+import argparse
 import json
 import os
 import plistlib
@@ -18,6 +19,13 @@ def run(*args):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--local-config",
+        action="store_true",
+        help="Use this checkout's existing archive and legacy lock (personal builds only)",
+    )
+    args = parser.parse_args()
     destination = ROOT / "dist" / "CD Rip.app"
     destination.parent.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="cd-rip-build-") as temp:
@@ -112,9 +120,9 @@ def main():
         )
         run(work / "make-icon", work / "AppIcon.iconset")
         run("iconutil", "-c", "icns", work / "AppIcon.iconset", "-o", resources / "AppIcon.icns")
-        if (ROOT / "library").exists():
+        if args.local_config and (ROOT / "library").exists():
             config["archive"] = str(ROOT / "library")
-        if (ROOT / ".lock").exists():
+        if args.local_config and (ROOT / ".lock").exists():
             config["legacy_lock"] = str(ROOT / ".lock")
         (resources / "config.json").write_text(json.dumps(config))
         info = {
@@ -124,12 +132,12 @@ def main():
             "CFBundleExecutable": "CD Rip",
             "CFBundleIconFile": "AppIcon",
             "CFBundlePackageType": "APPL",
-            "CFBundleShortVersionString": "0.1.0",
-            "CFBundleVersion": "1",
+            "CFBundleShortVersionString": "0.2.0",
+            "CFBundleVersion": "2",
             "LSMinimumSystemVersion": "13.0",
             "LSUIElement": True,
             "NSHighResolutionCapable": True,
-            "NSAppleEventsUsageDescription": "CD Rip adds your finished lossless albums to Music.",
+            "NSAppleEventsUsageDescription": "CD Rip adds your finished albums to Music.",
         }
         with (contents / "Info.plist").open("wb") as file:
             plistlib.dump(info, file)

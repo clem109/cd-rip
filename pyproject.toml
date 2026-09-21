@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "cd-rip"
 dynamic = ["version"]
-description = "Rip audio CDs to Apple Lossless with artwork, lyrics, and Music import."
+description = "A native macOS CD ripper with ALAC, AAC, FLAC, WAV, artwork, lyrics, and Music import."
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{name = "Clement Venard"}]

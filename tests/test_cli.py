@@ -79,6 +79,39 @@ class Tests(unittest.TestCase):
         with patch.object(app, "run", return_value=Mock(stdout=plistlib.dumps(data))):
             self.assertEqual(app.audio_devices(), {"/dev/disk5"})
 
+    def test_all_formats_encode_and_embed_metadata(self):
+        from mutagen.flac import FLAC
+        from mutagen.wave import WAVE
+
+        wav = self.folder / "source.wav"
+        make_wav(wav)
+        for fmt, (extension, _) in app.FORMATS.items():
+            with self.subTest(format=fmt):
+                target = self.folder / f"result-{fmt}.{extension}"
+                app.encode(wav, target, fmt, 256)
+                app.tag_file(target, META, 0, PNG, "Test lyrics")
+                if fmt != "aac":
+                    self.assertEqual(app.pcm_hash(wav), app.pcm_hash(target))
+                if fmt == "flac":
+                    audio = FLAC(target)
+                    self.assertEqual(audio["lyrics"], ["Test lyrics"])
+                    self.assertEqual(audio.pictures[0].data, PNG)
+                elif fmt == "wav":
+                    audio = WAVE(target)
+                    self.assertEqual(audio.tags.getall("USLT")[0].text, "Test lyrics")
+                    self.assertEqual(audio.tags.getall("APIC")[0].data, PNG)
+                else:
+                    audio = MP4(target)
+                    self.assertEqual(audio["\xa9lyr"], ["Test lyrics"])
+                    self.assertEqual(bytes(audio["covr"][0]), PNG)
+
+    def test_flac_cannot_be_imported_to_music(self):
+        job = {"format": "flac", "metadata": META, "files": [{"name": "test.flac"}]}
+        with patch.object(app, "run") as run:
+            with self.assertRaisesRegex(ValueError, "FLAC"):
+                app.import_music(self.folder, job)
+        run.assert_not_called()
+
     def test_wrong_release_layout_rejected(self):
         release = {
             "id": META["release_id"],

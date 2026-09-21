@@ -1,4 +1,6 @@
 include CONTRIBUTING.md
+include PRIVACY.md
+recursive-include docs/images *.png
 recursive-include docs *.md
 include docs/ci.yml
 recursive-include mac *.py *.swift
