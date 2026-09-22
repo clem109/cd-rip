@@ -320,10 +320,14 @@ def metadata_from_release(release, toc, require_id=True):
             "country": release.get("country", ""),
             "disambiguation": release.get("disambiguation", ""),
             "label": ", ".join(
-                info.get("label", {}).get("name", "") for info in release.get("label-info", [])
+                name
+                for info in release.get("label-info") or []
+                if (name := (info.get("label") or {}).get("name"))
             ),
             "catalogue": ", ".join(
-                info.get("catalog-number", "") for info in release.get("label-info", [])
+                number
+                for info in release.get("label-info") or []
+                if (number := info.get("catalog-number"))
             ),
             "disc": medium.get("position", 1),
             "disc_total": len(release["media"]),
@@ -959,11 +963,15 @@ def process_disc(device, args):
             # make one fresh identification attempt before tagging and importing.
             say("Retrying album identification…")
             recovered = identify(client, toc, args.release)
-            if recovered:
-                job["metadata"] = recovered
-                save(jobfile, job)
-                event("album", metadata=recovered, folder=str(folder))
-                fetched = fetch_enrichment(client, folder, job, not args.no_lyrics)
+            if not recovered:
+                raise RuntimeError(
+                    "Audio saved, but the album is still unidentified after retrying. "
+                    "Music import is waiting for album details."
+                )
+            job["metadata"] = recovered
+            save(jobfile, job)
+            event("album", metadata=recovered, folder=str(folder))
+            fetched = fetch_enrichment(client, folder, job, not args.no_lyrics)
         enrich(client, folder, job, not args.no_lyrics, fetched=fetched)
         if not args.no_music and audio_format != "flac":
             import_music(folder, job)

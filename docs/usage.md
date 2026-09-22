@@ -37,7 +37,9 @@ The installed `cd-rip` command uses the default archive unless overridden.
 MusicBrainz identifies CDs by disc layout. Multiple editions prompt for a choice.
 The Mac app recommends the most complete locally plausible match and selects it after a
 10-second countdown. Choose another edition or pause the countdown when the packaging differs.
-Unidentified discs are saved with placeholder tags; Music import waits for identification.
+If the initial lookup fails, audio extraction continues and identification is retried
+before tagging and Music import. If it still fails, the app shows Needs attention and
+keeps the audio safely archived; Music import waits for identification.
 
 ```sh
 cd-rip retry-metadata '/path/to/album'

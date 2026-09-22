@@ -170,6 +170,27 @@ class Tests(unittest.TestCase):
         self.assertEqual(metadata["catalogue"], "CRE CD 189")
         self.assertEqual(metadata["disambiguation"], "original pressing")
 
+    def test_null_label_fields_do_not_discard_valid_disc_matches(self):
+        release = {
+            "id": META["release_id"],
+            "title": "Corinne Bailey Rae",
+            "label-info": [
+                {"label": {"name": "EMI"}, "catalog-number": "009463 56544 2 4"},
+                {"label": {"name": "GoodGroove"}, "catalog-number": None},
+                {"label": None, "catalog-number": None},
+            ],
+            "media": [
+                {"discs": [{"id": TOC["id"]}], "tracks": [{"title": "Test", "length": 1000}]}
+            ],
+        }
+        client = Mock()
+        client.get.return_value = {"releases": [release]}
+        metadata = app.identify(client, TOC)
+        self.assertEqual(metadata["label"], "EMI, GoodGroove")
+        self.assertEqual(metadata["catalogue"], "009463 56544 2 4")
+        release["label-info"] = None
+        self.assertEqual(app.identify(client, TOC)["catalogue"], "")
+
     def test_import_success_skip_and_uncertain_failure(self):
         job = {"metadata": META, "files": [{"name": "test.m4a"}]}
         with patch.object(app, "run") as run:
@@ -344,7 +365,9 @@ class Tests(unittest.TestCase):
         with (
             patch.object(app, "audio_devices", return_value={"/dev/disk5"}),
             patch.object(app, "read_toc", return_value=copy.deepcopy(TOC)),
-            patch.object(app, "identify", side_effect=[None, copy.deepcopy(META)]) as identify,
+            patch.object(
+                app, "identify", side_effect=[TimeoutError("offline"), copy.deepcopy(META)]
+            ) as identify,
             patch.object(app, "fetch_enrichment", return_value=(None, [None], [])),
             patch.object(app, "run", side_effect=run),
         ):
@@ -356,6 +379,40 @@ class Tests(unittest.TestCase):
         self.assertTrue(job["files"][0]["imported"])
         tags = MP4(self.folder / TOC["id"] / job["files"][0]["name"])
         self.assertEqual(tags["\xa9alb"], [META["album"]])
+
+    def test_unidentified_after_retry_preserves_audio_and_reports_attention(self):
+        args = argparse.Namespace(
+            output=self.folder, release=None, no_music=False, no_eject=False, no_lyrics=True
+        )
+        real_run = app.run
+
+        def run(command, **kwargs):
+            if command[0] == "cd-paranoia":
+                make_wav(command[-1])
+                return Mock()
+            if command[0] == "diskutil":
+                return Mock()
+            return real_run(command, **kwargs)
+
+        with (
+            patch.object(app, "audio_devices", return_value={"/dev/disk5"}),
+            patch.object(app, "read_toc", return_value=copy.deepcopy(TOC)),
+            patch.object(app, "identify", return_value=None) as identify,
+            patch.object(app, "fetch_enrichment", return_value=(None, [None], [])),
+            patch.object(app, "run", side_effect=run),
+            patch.object(app, "import_music") as import_music,
+            patch.object(app, "event") as event,
+        ):
+            app.process_disc("/dev/disk5", args)
+
+        job = app.load_job(self.folder / TOC["id"])
+        self.assertEqual(identify.call_count, 2)
+        self.assertTrue(job["audio_complete"])
+        self.assertEqual(len(job["files"]), 1)
+        self.assertIn("unidentified after retrying", job["postprocess_error"])
+        import_music.assert_not_called()
+        completion = next(c.kwargs for c in event.call_args_list if c.args[0] == "complete")
+        self.assertEqual(completion["error"], job["postprocess_error"])
 
     def run_overlapping_pipeline(self, failure=None, resume=False):
         toc = copy.deepcopy(TOC)
