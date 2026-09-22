@@ -79,6 +79,37 @@ class Tests(unittest.TestCase):
         with patch.object(app, "run", return_value=Mock(stdout=plistlib.dumps(data))):
             self.assertEqual(app.audio_devices(), {"/dev/disk5"})
 
+    def test_disk_inventory_detects_audio_from_device_metadata(self):
+        inventory = {
+            "AllDisksAndPartitions": [
+                {
+                    "DeviceIdentifier": "disk5",
+                    "Content": "CD_partition_scheme",
+                    "MountPoint": "/Volumes/Test CD",
+                }
+            ]
+        }
+        info = {"FilesystemName": "CD-DA", "FilesystemUserVisibleName": "CD Audio"}
+
+        def run(command, **kwargs):
+            self.assertNotIn(".TOC.plist", " ".join(command))
+            payload = inventory if command[1] == "list" else info
+            return Mock(stdout=plistlib.dumps(payload))
+
+        with patch.object(app, "run", side_effect=run) as run_mock:
+            self.assertEqual(app.audio_devices(), {"/dev/disk5"})
+        self.assertEqual(run_mock.call_count, 2)
+        self.assertEqual(
+            run_mock.call_args_list[1].args[0], ["diskutil", "info", "-plist", "/dev/disk5"]
+        )
+
+    def test_edition_ranking_prefers_local_then_regional_complete_match(self):
+        australia = {"country": "AU", "date": "2008", "label": "Fiction", "catalogue": "1"}
+        europe = {"country": "XE", "date": "2008-03-17", "label": "Fiction", "catalogue": "1"}
+        british = {"country": "GB", "date": "2008", "label": "Fiction", "catalogue": "1"}
+        self.assertIs(app.rank_editions([australia, europe], "GB")[0], europe)
+        self.assertIs(app.rank_editions([europe, british], "GB")[0], british)
+
     def test_all_formats_encode_and_embed_metadata(self):
         from mutagen.flac import FLAC
         from mutagen.wave import WAVE
@@ -289,12 +320,155 @@ class Tests(unittest.TestCase):
             patch.object(app, "run", side_effect=fail) as run,
             patch.object(app.subprocess, "run") as mount,
         ):
-            with self.assertRaises(subprocess.CalledProcessError):
+            with self.assertRaisesRegex(RuntimeError, "could not be read securely"):
                 app.process_disc("/dev/disk5", args)
         self.assertFalse(
             any(c.args[0][0] == "osascript" or "eject" in c.args[0] for c in run.call_args_list)
         )
         self.assertEqual(mount.call_args.args[0], ["diskutil", "mountDisk", "/dev/disk5"])
+
+    def run_overlapping_pipeline(self, failure=None, resume=False):
+        toc = copy.deepcopy(TOC)
+        toc.update(last=2, leadout=300)
+        toc["tracks"].append({"number": 2, "offset": 225, "sectors": 75})
+        meta = copy.deepcopy(META)
+        meta["tracks"].append({"title": "Second", "artist": "Test Artist"})
+        args = argparse.Namespace(
+            output=self.folder, release=None, no_music=False, no_eject=False, no_lyrics=True
+        )
+        encoding, second_read = threading.Event(), threading.Event()
+        if resume:
+            encoding.set()  # First track is already committed; only track two is read.
+        real_prepare = app.prepare_track
+        real_run = app.run
+        native_run = subprocess.run
+        operations = []
+
+        def prepare(*values):
+            if values[3] == 0:
+                encoding.set()
+                self.assertTrue(second_read.wait(5), "Next read must overlap encoding")
+            if failure == "encode":
+                raise RuntimeError("encoding failed")
+            return real_prepare(*values)
+
+        def run(command, **kwargs):
+            if command[0] == "cd-paranoia":
+                operations.append("read")
+                if command[-2] == "2":
+                    self.assertTrue(encoding.wait(5))
+                    second_read.set()
+                    if failure == "read":
+                        raise RuntimeError("reading failed")
+                make_wav(command[-1])
+                return Mock()
+            if command[0] in ("diskutil", "osascript"):
+                operations.append(command[1] if command[0] == "diskutil" else "music")
+                if "eject" in command:
+                    job = app.load_job(self.folder / TOC["id"])
+                    self.assertTrue(job["audio_complete"])
+                    self.assertEqual(len(job["files"]), 2)
+                return Mock()
+            return real_run(command, **kwargs)
+
+        with (
+            patch.object(app, "audio_devices", return_value={"/dev/disk5"}),
+            patch.object(app, "read_toc", return_value=toc),
+            patch.object(app, "identify", return_value=meta),
+            patch.object(app, "fetch_enrichment", return_value=(None, [None, None], [])),
+            patch.object(app, "prepare_track", side_effect=prepare),
+            patch.object(app, "run", side_effect=run),
+            patch.object(app.subprocess, "run") as subprocess_run,
+        ):
+            # Remounts must be mocked separately from real ffmpeg subprocesses.
+            subprocess_run.side_effect = lambda cmd, **kw: (
+                Mock() if cmd[0] == "diskutil" else native_run(cmd, **kw)
+            )
+            if failure:
+                with self.assertRaisesRegex(RuntimeError, "failed"):
+                    app.process_disc("/dev/disk5", args)
+            else:
+                app.process_disc("/dev/disk5", args)
+        return app.load_job(self.folder / TOC["id"]), operations
+
+    def test_encoding_overlaps_next_read_and_commits_in_order(self):
+        job, operations = self.run_overlapping_pipeline()
+        self.assertEqual([entry["name"][:2] for entry in job["files"]], ["01", "02"])
+        self.assertEqual(operations, ["unmountDisk", "read", "read", "eject", "music", "music"])
+        for entry in job["files"]:
+            self.assertGreaterEqual(entry["read_seconds"], 0)
+            self.assertGreater(entry["encode_verify_seconds"], 0)
+        self.assertFalse(list((self.folder / TOC["id"]).glob("*.partial.wav")))
+
+    def test_later_read_failure_preserves_previous_encoded_track(self):
+        job, operations = self.run_overlapping_pipeline("read")
+        self.assertFalse(job["audio_complete"])
+        self.assertEqual(len(job["files"]), 1)
+        self.assertNotIn("eject", operations)
+        self.assertNotIn("music", operations)
+
+    def test_encoder_failure_retains_pcm_and_never_ejects(self):
+        job, operations = self.run_overlapping_pipeline("encode")
+        self.assertFalse(job["audio_complete"])
+        self.assertEqual(job["files"], [])
+        self.assertEqual(len(list((self.folder / TOC["id"]).glob("*.partial.wav"))), 2)
+        self.assertNotIn("eject", operations)
+        self.assertNotIn("music", operations)
+
+    def test_pipeline_resumes_after_read_failure_without_rereading_saved_track(self):
+        first, _ = self.run_overlapping_pipeline("read")
+        resumed, operations = self.run_overlapping_pipeline(resume=True)
+        self.assertEqual(operations.count("read"), 1)
+        self.assertTrue(resumed["audio_complete"])
+        self.assertEqual(first["files"][0]["sha256"], resumed["files"][0]["sha256"])
+
+    def test_worker_tagging_failure_does_not_publish_or_remove_pcm(self):
+        wav, target = self.folder / "source.wav", self.folder / "result.m4a"
+        make_wav(wav)
+        with patch.object(app, "tag_file", side_effect=RuntimeError("tag failed")):
+            with self.assertRaisesRegex(RuntimeError, "tag failed"):
+                app.prepare_track(wav, target, META, 0, "alac", 256)
+        self.assertTrue(wav.exists())
+        self.assertFalse(target.exists())
+        self.assertFalse((self.folder / "job.json").exists())
+
+    def test_busy_drive_retries_only_open_failures(self):
+        busy = b"Resource busy\nUnable to open cdrom drive\n"
+        for mode in ("recovered", "busy", "read_error", "changed"):
+            with self.subTest(mode=mode):
+                calls = []
+                log = self.folder / f"{mode}.log"
+                # Old busy errors must not cause retry of a new audio error.
+                log.write_bytes(busy)
+
+                def run(command, **kwargs):
+                    calls.append(command)
+                    if command[0] == "cd-paranoia":
+                        reads = sum(c[0] == "cd-paranoia" for c in calls)
+                        if mode == "recovered" and reads == 2:
+                            return Mock()
+                        kwargs["stderr"].write(
+                            b"unrecoverable skip\n" if mode == "read_error" else busy
+                        )
+                        kwargs["stderr"].flush()
+                        raise subprocess.CalledProcessError(1, command)
+                    return Mock()
+
+                with (
+                    patch.object(app, "run", side_effect=run),
+                    patch.object(app, "read_toc", return_value={} if mode == "changed" else TOC),
+                    patch.object(app.time, "sleep"),
+                ):
+                    if mode == "recovered":
+                        app.extract_track("/dev/disk5", TOC, 2, self.folder / "x.wav", log)
+                    else:
+                        with self.assertRaises(RuntimeError):
+                            app.extract_track("/dev/disk5", TOC, 2, self.folder / "x.wav", log)
+                self.assertEqual(
+                    sum(c[0] == "cd-paranoia" for c in calls),
+                    {"recovered": 2, "busy": 3, "read_error": 1, "changed": 1}[mode],
+                )
+                self.assertFalse(any("force" in c for c in calls))
 
     def test_prefetch_does_not_mutate_manifest_or_require_audio(self):
         job = {"metadata": copy.deepcopy(META), "toc": copy.deepcopy(TOC), "files": []}
@@ -357,16 +531,33 @@ class Tests(unittest.TestCase):
         import queue
         import threading
 
-        stop, choices = threading.Event(), queue.Queue()
-        stream = io.StringIO('invalid\n[]\n{"command":"choose","choice":2}\n{"command":"stop"}\n')
+        stop, scan, choices = threading.Event(), threading.Event(), queue.Queue()
+        stream = io.StringIO(
+            'invalid\n[]\n{"command":"choose","choice":2}\n{"command":"scan"}\n{"command":"stop"}\n'
+        )
         with (
             patch.object(app.sys, "stdin", stream),
             patch.object(app, "STOP", stop),
+            patch.object(app, "SCAN", scan),
             patch.object(app, "CHOICES", choices),
         ):
             app.read_controls()
         self.assertEqual(choices.get_nowait(), "2")
+        self.assertTrue(scan.is_set())
         self.assertTrue(stop.is_set())
+
+    def test_scan_processes_disc_that_was_present_when_watcher_started(self):
+        scan = threading.Event()
+        scan.set()
+        with (
+            patch.object(app, "SCAN", scan),
+            patch.object(app, "audio_devices", return_value={"/dev/disk5"}),
+            patch.object(app, "process_disc", return_value=False) as process,
+            patch.object(app.time, "sleep", side_effect=KeyboardInterrupt),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                app.watch(Mock())
+        process.assert_called_once()
 
     def test_gui_messages_are_machine_readable(self):
         import json

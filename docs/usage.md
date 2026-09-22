@@ -8,6 +8,18 @@ FLAC never imports into Music. WAV carries ID3 tags, whose support varies by pla
 Lossless formats undergo PCM identity checks; AAC uses decode and duration validation.
 Different codecs and AAC bitrates use separate archive directories.
 
+## Ripping performance
+
+The drive reads one track at a time while a background worker encodes and verifies
+the previous track. Artwork and lyrics are fetched concurrently. The queue is bounded
+to one encoding track and one reading track; secure reading remains enabled.
+The CD is ejected only after all audio has been verified and recorded in the archive.
+Per-track `read_seconds` and `encode_verify_seconds` in `job.json` help identify bottlenecks
+(these overlap, so they should not be added to estimate elapsed time).
+Actual speed gains depend on the drive, disc, and output format; no hardware benchmark
+has yet been run for the overlapping pipeline. Continuous batch reads and AccurateRip
+verification are not implemented.
+
 ## Storage
 
 The default archive is `~/Music/CD Rip/<disc-id>/`. Each folder contains ALAC tracks,
@@ -23,6 +35,8 @@ The installed `cd-rip` command uses the default archive unless overridden.
 ## Identification and missing metadata
 
 MusicBrainz identifies CDs by disc layout. Multiple editions prompt for a choice.
+The Mac app recommends the most complete locally plausible match and selects it after a
+10-second countdown. Choose another edition or pause the countdown when the packaging differs.
 Unidentified discs are saved with placeholder tags; Music import waits for identification.
 
 ```sh
@@ -59,12 +73,22 @@ Duplicate detection covers this tool's jobs, not previous Music imports.
 
 ## Read failures
 
+If the drive reports busy when opening a track, the app checks that the same disc is
+inserted, requests a normal unmount, and retries at most twice. It never force-unmounts
+another app or disables secure reading. If the drive remains busy, stop CD playback or
+importing in other apps, stop watching, then choose **Rip Inserted CD** to resume.
+
 Uncorrectable reads stop extraction and leave the disc inserted. Saved tracks and logs remain.
 Clean/reinsert the disc and run `cd-rip rip` to resume. If a crash leaves an unrecorded
 `.m4a`, move it aside before retrying; the tool refuses to overwrite it.
 
 Use `--no-eject` to keep a completed CD inserted, or `--device /dev/diskN` with `rip`
 to select a drive. Only mounted audio CDs are accepted.
+
+Watch mode ignores a CD that was already inserted when the watcher started. In the Mac app,
+choose **Scan for CD** to process the currently inserted disc without restarting the watcher.
+The same control retries a disc that previously needed attention while preserving saved tracks.
+CD detection uses `diskutil` device metadata and does not inspect the mounted CD filesystem.
 
 ## Limits
 

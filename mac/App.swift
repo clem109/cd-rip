@@ -18,6 +18,7 @@ struct AlbumTrack: Identifiable {
 
 final class Ripper: ObservableObject {
     @Published var running = false
+    @Published var canScan = false
     @Published var stopping = false
     @Published var checking = false
     @Published var phase = "Ready when you are"
@@ -26,6 +27,7 @@ final class Ripper: ObservableObject {
     @Published var artist = "Apple Lossless · Artwork · Lyrics"
     @Published var fraction: Double = 0
     @Published var track = 0
+    @Published var encodingTrack = 0
     @Published var total = 0
     @Published var cover: NSImage?
     @Published var tracks: [AlbumTrack] = []
@@ -33,6 +35,7 @@ final class Ripper: ObservableObject {
     @Published var showSettings = false
     @Published var audioComplete = false
     @Published var editions: [Edition] = []
+    @Published var editionCountdown = 0
     @Published var logs: [String] = []
     @Published var showLog = false
     @Published var addToMusic = true
@@ -49,6 +52,7 @@ final class Ripper: ObservableObject {
     var expected: Double = 0
     var timer: Timer?
     var quitWhenDone = false
+    private var editionTimer: Timer?
     private var lineBuffer = Data()
     private var config: [String: String] = [:]
 
@@ -193,6 +197,7 @@ final class Ripper: ObservableObject {
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
         env["CD_RIP_GUI"] = "1"
+        env["CD_RIP_REGION"] = Locale.current.region?.identifier ?? ""
         env["PYTHONUNBUFFERED"] = "1"
         if let legacy = config["legacy_lock"] { env["CD_RIP_LEGACY_LOCK"] = legacy }
         child.environment = env
@@ -204,10 +209,12 @@ final class Ripper: ObservableObject {
         process = child
         lineBuffer = Data()
         stopping = false
+        canScan = false
         checking = command == "doctor"
         running = !checking
         phase = checking ? "Checking setup…" : "Starting…"
-        detail = checking ? "No drive access is needed." : "Any CD already inserted is left alone in watch mode."
+        detail = checking ? "No drive access is needed."
+            : (command == "watch" ? "Checking for newly inserted CDs." : "Reading the inserted CD.")
         UserDefaults.standard.set(addToMusic, forKey: "music")
         UserDefaults.standard.set(fetchLyrics, forKey: "lyrics")
         UserDefaults.standard.set(audioFormat, forKey: "format")
@@ -223,7 +230,9 @@ final class Ripper: ObservableObject {
                 self.running = false
                 self.checking = false
                 self.stopping = false
+                self.canScan = false
                 self.editions = []
+                self.cancelEditionCountdown()
                 self.partial = nil
                 self.process = nil
                 self.input = nil
@@ -256,15 +265,47 @@ final class Ripper: ObservableObject {
 
     func stop() {
         guard running else { return }
+        cancelEditionCountdown()
         stopping = true
         detail = "Finishing this CD, then stopping."
         send(["command": "stop"])
     }
 
+    func scan() {
+        guard running && canScan && !stopping else { return }
+        canScan = false
+        phase = "Scanning for a CD…"
+        detail = "Checking the connected optical drive."
+        send(["command": "scan"])
+    }
+
     func choose(_ choice: Int?) {
+        cancelEditionCountdown()
         send(["command": "choose", "choice": choice.map(String.init) ?? ""])
         editions = []
         phase = "Identifying album…"
+    }
+
+    func startEditionCountdown() {
+        editionTimer?.invalidate()
+        editionCountdown = 10
+        editionTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            guard !self.editions.isEmpty else { self.cancelEditionCountdown(); return }
+            if self.editionCountdown <= 1 {
+                let recommended = self.editions.first?.id
+                self.cancelEditionCountdown()
+                if let recommended { self.choose(recommended) }
+            } else {
+                self.editionCountdown -= 1
+            }
+        }
+    }
+
+    func cancelEditionCountdown() {
+        editionTimer?.invalidate()
+        editionTimer = nil
+        editionCountdown = 0
     }
 
     func importTrack(_ path: String) {
@@ -311,10 +352,18 @@ final class Ripper: ObservableObject {
                 log(message)
                 if message.hasPrefix("Error:") { fail(message) }
             case "waiting":
+                canScan = true
                 if !stopping && phase != "Needs attention" {
                     phase = "Watching for CDs"
-                    detail = "Insert the next CD whenever you're ready."
+                    let present = event["disc_present"] as? Bool ?? false
+                    detail = present
+                        ? "A CD is inserted. Choose Scan for CD to process it."
+                        : "Insert the next CD whenever you're ready."
                 }
+            case "scanning":
+                canScan = false
+                phase = "Scanning for a CD…"
+                detail = "Checking the connected optical drive."
             case "choices":
                 let values = event["releases"] as? [[String: Any]] ?? []
                 editions = values.enumerated().map { i, item in
@@ -322,11 +371,25 @@ final class Ripper: ObservableObject {
                             detail: [item["artist"], item["date"], item["country"], item["label"], item["catalogue"], item["disambiguation"]]
                                 .compactMap { $0 as? String }.filter { !$0.isEmpty }.joined(separator: " · "))
                 }
+                if let candidate = values.first {
+                    album = candidate["album"] as? String ?? "Inserted CD"
+                    artist = candidate["artist"] as? String ?? "Choose an edition"
+                    let candidateTracks = candidate["tracks"] as? [[String: Any]] ?? []
+                    total = candidateTracks.count
+                    tracks = []
+                    fraction = 0
+                    folder = nil
+                    cover = nil
+                    releaseDetail = "Select the edition that matches your CD."
+                }
                 phase = "Choose your edition"
                 detail = "Several releases match this disc."
+                startEditionCountdown()
                 NSApp.activate(ignoringOtherApps: true)
                 (NSApp.delegate as? AppDelegate)?.showWindow()
             case "album":
+                canScan = false
+                encodingTrack = 0
                 let meta = event["metadata"] as? [String: Any] ?? [:]
                 album = meta["album"] as? String ?? "Unknown album"
                 artist = meta["artist"] as? String ?? "Unknown artist"
@@ -341,7 +404,17 @@ final class Ripper: ObservableObject {
                 detail = event["title"] as? String ?? ""
                 partial = (event["partial"] as? String).map { URL(fileURLWithPath: $0) }
                 expected = event["expected"] as? Double ?? 0
+            case "encoding":
+                encodingTrack = event["number"] as? Int ?? 0
+            case "track_saved":
+                encodingTrack = 0
+                refreshAlbum()
+            case "verifying":
+                partial = nil
+                phase = "Verifying the final track"
+                detail = "Keeping the CD inserted until all audio is safely saved."
             case "enriching":
+                encodingTrack = 0
                 partial = nil; fraction = 1
                 phase = "Adding the finishing touches"
                 detail = "Finishing artwork and lyrics, then adding to Music."
@@ -457,6 +530,8 @@ struct ContentView: View {
                     Label("In Music", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
                 } else if item.saved {
                     Label("Ripped", systemImage: "checkmark.circle").foregroundStyle(.secondary)
+                } else if item.id == model.encodingTrack && model.running {
+                    Text("Verifying").foregroundStyle(Color.accentColor)
                 } else if item.id == model.track && model.partial != nil {
                     HStack(spacing: 7) {
                         ProgressView(value: min(1, max(0, model.fraction * Double(model.total) - Double(item.id - 1))))
@@ -498,6 +573,8 @@ struct ContentView: View {
                 if model.running {
                     Button(model.stopping ? "Finishing…" : "Stop After This CD") { model.stop() }
                         .disabled(model.stopping)
+                    Button("Scan for CD") { model.scan() }
+                        .disabled(model.stopping || !model.canScan)
                 } else {
                     Button("Start Watching") { model.launch("watch") }
                         .buttonStyle(.borderedProminent).disabled(model.checking)
@@ -517,6 +594,10 @@ struct ContentView: View {
             Text("Choose Your Edition").font(.title3.bold())
             Text("Match the date, country and catalogue number on your CD.")
                 .foregroundStyle(.secondary)
+            if model.editionCountdown > 0 {
+                Text("Using the recommended edition in \(model.editionCountdown) seconds.")
+                    .font(.callout).foregroundStyle(.secondary).monospacedDigit()
+            }
             ScrollView {
                 VStack(spacing: 8) {
                     ForEach(model.editions) { edition in
@@ -527,13 +608,21 @@ struct ContentView: View {
                                     Text(edition.detail).font(.callout).foregroundStyle(.secondary)
                                 }
                                 Spacer()
+                                if edition.id == model.editions.first?.id {
+                                    Text("Recommended").font(.caption.bold()).foregroundStyle(Color.accentColor)
+                                }
                                 Image(systemName: "chevron.right").foregroundStyle(.secondary)
                             }.padding(12).frame(maxWidth: .infinity, alignment: .leading)
                         }.buttonStyle(.bordered)
                     }
                 }
             }.frame(minHeight: 130)
-            Button("Identify Later") { model.choose(nil) }
+            HStack {
+                Button("Identify Later") { model.choose(nil) }
+                if model.editionCountdown > 0 {
+                    Button("Pause Countdown") { model.cancelEditionCountdown() }
+                }
+            }
         }.padding(24).frame(maxHeight: .infinity)
     }
 

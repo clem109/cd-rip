@@ -187,6 +187,7 @@ def main():
             "LSUIElement": True,
             "NSHighResolutionCapable": True,
             "NSAppleEventsUsageDescription": "CD Rip adds your finished albums to Music.",
+            "NSRemovableVolumesUsageDescription": "CD Rip reads audio from CDs you insert.",
         }
         with (contents / "Info.plist").open("wb") as file:
             plistlib.dump(info, file)

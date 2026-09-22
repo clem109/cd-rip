@@ -35,6 +35,7 @@ MB = "https://musicbrainz.org/ws/2"
 UA = f"cd-rip/{__version__} (https://github.com/clem109/cd-rip)"
 GUI = os.environ.get("CD_RIP_GUI") == "1"
 STOP = threading.Event()
+SCAN = threading.Event()
 CHOICES = queue.Queue()
 IMPORT_RESULTS = queue.Queue()
 OUTPUT_LOCK = threading.Lock()
@@ -56,6 +57,8 @@ def read_controls():
             if message.get("command") == "stop":
                 STOP.set()
                 CHOICES.put("")
+            elif message.get("command") == "scan":
+                SCAN.set()
             elif message.get("command") == "choose":
                 CHOICES.put(str(message.get("choice", "")))
             elif message.get("command") == "import_result":
@@ -157,18 +160,21 @@ def read_toc(device):
 
 
 def audio_devices():
-    """Read the OS disk inventory, not audio sectors. Only mounted audio CDs."""
+    """Read OS device metadata, never a mounted volume or audio sectors."""
     result = run(["diskutil", "list", "-plist"], capture_output=True, timeout=15)
     tree = plistlib.loads(result.stdout)
     found = set()
+    optical = set()
 
     def walk(node, parent=None):
         if isinstance(node, dict):
             device = node.get("DeviceIdentifier", parent)
-            mount = node.get("MountPoint")
-            if node.get("Content") == "CD_DA" or (mount and (Path(mount) / ".TOC.plist").is_file()):
+            content = node.get("Content")
+            if content == "CD_DA":
                 if device and re.fullmatch(r"disk\d+(s\d+)*", device):
                     found.add("/dev/" + re.match(r"disk\d+", device)[0])
+            elif content == "CD_partition_scheme" and device and re.fullmatch(r"disk\d+", device):
+                optical.add(device)
             for value in node.values():
                 if isinstance(value, (dict, list)):
                     walk(value, device)
@@ -177,7 +183,82 @@ def audio_devices():
                 walk(value, parent)
 
     walk(tree)
+    # `diskutil list` can omit audio partitions on recent macOS releases. Query only
+    # device metadata; touching `.TOC.plist` on the mounted CD triggers Files & Folders
+    # privacy prompts and is unnecessary.
+    for device in optical:
+        try:
+            info = plistlib.loads(
+                run(
+                    ["diskutil", "info", "-plist", "/dev/" + device],
+                    capture_output=True,
+                    timeout=15,
+                ).stdout
+            )
+        except (subprocess.SubprocessError, plistlib.InvalidFileException):
+            continue
+        if (
+            info.get("FilesystemName") == "CD-DA"
+            or info.get("FilesystemUserVisibleName") == "CD Audio"
+        ):
+            found.add("/dev/" + device)
     return found
+
+
+EUROPEAN_REGIONS = {
+    "AT",
+    "BE",
+    "BG",
+    "CH",
+    "CY",
+    "CZ",
+    "DE",
+    "DK",
+    "EE",
+    "ES",
+    "FI",
+    "FR",
+    "GB",
+    "GR",
+    "HR",
+    "HU",
+    "IE",
+    "IS",
+    "IT",
+    "LI",
+    "LT",
+    "LU",
+    "LV",
+    "MT",
+    "NL",
+    "NO",
+    "PL",
+    "PT",
+    "RO",
+    "SE",
+    "SI",
+    "SK",
+}
+
+
+def rank_editions(candidates, region=""):
+    """Put the most complete, locally plausible edition first; keep ties stable."""
+    region = region.upper()
+
+    def score(item):
+        country = (item.get("country") or "").upper()
+        date = item.get("date") or ""
+        return (
+            20 * (country == region and bool(region))
+            + 12 * (country == "XE" and region in EUROPEAN_REGIONS)
+            + 4 * (len(date) == 10)
+            + 2 * bool(item.get("catalogue"))
+            + 2 * bool(item.get("label"))
+            + bool(country)
+            - bool(item.get("disambiguation"))
+        )
+
+    return sorted(candidates, key=score, reverse=True)
 
 
 class Client:
@@ -280,6 +361,7 @@ def identify(client, toc, release_id=None):
             candidates.append(metadata_from_release(release, toc))
         except (ValueError, KeyError):
             pass
+    candidates = rank_editions(candidates, os.environ.get("CD_RIP_REGION", ""))
     if not candidates:
         return None
     if len(candidates) == 1:
@@ -626,6 +708,63 @@ def check_dependencies():
         raise RuntimeError("Missing tools: " + ", ".join(missing))
 
 
+def extract_track(device, toc, number, wav, logpath):
+    """Retry only failure to open a busy drive, never damaged audio or skipped data."""
+    for attempt in range(3):
+        with logpath.open("ab") as log:
+            start = log.tell()
+            try:
+                run(
+                    ["cd-paranoia", "-d", device, "-X", "-e", "--", str(number), wav],
+                    stdout=log,
+                    stderr=log,
+                    timeout=1800,
+                )
+                return
+            except subprocess.CalledProcessError as exc:
+                error = exc
+        with logpath.open("rb") as log:
+            log.seek(start)
+            output = log.read(65536).decode(errors="replace")
+        busy = "Resource busy" in output and "Unable to open cdrom drive" in output
+        if not busy:
+            raise RuntimeError(
+                f"Track {number} could not be read securely. Saved tracks are safe. "
+                f"Check or clean the disc, then retry. Details: {logpath.name}"
+            ) from error
+        if attempt == 2:
+            break
+        say(
+            f"Drive busy before track {number}; releasing the mount and retrying ({attempt + 1}/2)…"
+        )
+        time.sleep(1)
+        try:
+            # Never retry against a replacement disc or force another app off the drive.
+            if read_toc(device) != toc:
+                raise RuntimeError("Disc changed; refusing to resume against a different CD")
+            run(["diskutil", "unmountDisk", device], capture_output=True, timeout=30)
+        except (subprocess.SubprocessError, RuntimeError) as exc:
+            raise RuntimeError(
+                f"Cannot safely reopen the CD for track {number}: {exc}. "
+                "Stop CD playback or importing in other apps, then retry. Saved tracks are safe."
+            ) from exc
+    raise RuntimeError(
+        f"The CD drive is busy before track {number}. Stop CD playback or importing in "
+        "Music or other apps, then stop watching and choose Rip Inserted CD to resume. "
+        f"Saved tracks are safe. Details: {logpath.name}"
+    ) from error
+
+
+def prepare_track(wav, target, metadata, index, audio_format, bitrate):
+    """Encode off the drive thread; never publish audio or mutate the job here."""
+    staged = target.parent / ".encoding" / target.name
+    staged.parent.mkdir(exist_ok=True)
+    started = time.monotonic()
+    encode(wav, staged, audio_format, bitrate)
+    tag_file(staged, metadata, index)
+    return staged, digest(staged), time.monotonic() - started
+
+
 def process_disc(device, args):
     if device not in audio_devices():
         raise RuntimeError("Selected device is not a mounted audio CD; refusing to access it")
@@ -690,8 +829,37 @@ def process_disc(device, args):
     metadata = pool.submit(
         fetch_enrichment, Client(), folder, copy.deepcopy(job), not args.no_lyrics, cancel_metadata
     )
+    encoder = ThreadPoolExecutor(max_workers=1, thread_name_prefix="encoding")
+    pending = None
+
+    def commit_pending():
+        nonlocal pending
+        if pending is None:
+            return
+        future, wav, target, index, read_seconds = pending
+        pending = None
+        staged, checksum, encode_seconds = future.result()
+        if target.exists():
+            raise RuntimeError("Unrecorded file exists; refusing to overwrite: " + str(target))
+        staged.replace(target)
+        job["files"].append(
+            {
+                "name": target.name,
+                "sha256": checksum,
+                "imported": False,
+                "read_seconds": read_seconds,
+                "encode_verify_seconds": encode_seconds,
+            }
+        )
+        save(jobfile, job)
+        wav.unlink()  # Only discard extracted PCM after the verified file is recorded.
+        event("track_saved", number=index + 1)
+
     try:
         for index, track in enumerate(toc["tracks"]):
+            # Surface an encoder failure before starting another read when possible.
+            if pending is not None and pending[0].done():
+                commit_pending()
             if index < len(job["files"]):
                 entry = job["files"][index]
                 if digest(folder / entry["name"]) != entry["sha256"]:
@@ -718,13 +886,8 @@ def process_disc(device, args):
                 expected=track["sectors"] * 2352,
             )
             # -X aborts on unrecoverable skips, instead of accepting damaged audio.
-            with (folder / f"{index + 1:02}.rip.log").open("ab") as log:
-                run(
-                    ["cd-paranoia", "-d", device, "-X", "-e", "--", str(track["number"]), wav],
-                    stdout=log,
-                    stderr=log,
-                    timeout=1800,
-                )
+            read_started = time.monotonic()
+            extract_track(device, toc, track["number"], wav, folder / f"{index + 1:02}.rip.log")
             import wave
 
             with wave.open(str(wav)) as audio:
@@ -738,21 +901,45 @@ def process_disc(device, args):
                     raise RuntimeError(
                         "Extracted track length differs from CD TOC; WAV retained for review"
                     )
-            encode(wav, target, audio_format, bitrate)
-            tag_file(target, job["metadata"], index)
-            job["files"].append({"name": target.name, "sha256": digest(target), "imported": False})
-            save(jobfile, job)
-            wav.unlink()  # Only this tool's verified temporary extraction.
+            read_seconds = time.monotonic() - read_started
+            # At most one encoding track plus one reading track: bounded disk usage,
+            # a single drive reader, and ordered manifest writes on this thread only.
+            commit_pending()
+            pending = (
+                encoder.submit(
+                    prepare_track,
+                    wav,
+                    target,
+                    copy.deepcopy(job["metadata"]),
+                    index,
+                    audio_format,
+                    bitrate,
+                ),
+                wav,
+                target,
+                index,
+                read_seconds,
+            )
+            event("encoding", number=index + 1)
+        event("verifying")
+        commit_pending()
         job["audio_complete"] = True
         save(jobfile, job)
-    except BaseException:
+    except BaseException as exc:
         # Make the disc visible again after failure/Control-C; never eject on read failure.
         cancel_metadata.set()
         try:
+            # Preserve a successfully encoded prior track even if the next read failed.
+            try:
+                commit_pending()
+            except BaseException as encode_error:
+                exc.add_note(f"Pending encoding also failed: {encode_error}")
             subprocess.run(["diskutil", "mountDisk", device], capture_output=True, timeout=30)
         finally:
             pool.shutdown(wait=True, cancel_futures=True)
         raise
+    finally:
+        encoder.shutdown(wait=True, cancel_futures=True)
     try:
         if not args.no_eject:
             run(["diskutil", "eject", device], capture_output=True, timeout=30)
@@ -790,11 +977,16 @@ def process_disc(device, args):
 def watch(args):
     seen = audio_devices()
     say("Waiting for a NEW CD. Any disc currently inserted is ignored. Ctrl-C stops.")
-    event("waiting")
+    event("waiting", disc_present=bool(seen))
     while not STOP.is_set():
         devices = audio_devices()
         seen.intersection_update(devices)
-        for device in sorted(devices - seen):
+        scan_requested = SCAN.is_set()
+        if scan_requested:
+            SCAN.clear()
+            event("scanning")
+        candidates = devices if scan_requested else devices - seen
+        for device in sorted(candidates):
             if STOP.is_set():
                 break
             seen.add(device)  # Failures never trigger an endless automatic retry.
@@ -802,12 +994,15 @@ def watch(args):
                 if process_disc(device, args):
                     # A new disc may be inserted on the SAME device while tags are fetched.
                     seen.discard(device)
+                    devices.discard(device)  # The completed disc was ejected.
             except Exception as exc:
                 say(
                     f"Needs attention ({device}): {exc}. Reinsert after resolving, or use rip explicitly."
                 )
                 event("attention", message=str(exc))
-            event("waiting")
+            event("waiting", disc_present=bool(devices))
+        if scan_requested and not candidates:
+            event("waiting", disc_present=False)
         time.sleep(3)
 
 
