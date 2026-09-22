@@ -952,7 +952,19 @@ def process_disc(device, args):
         pool.shutdown(wait=True)
     say("Embedding artwork and lyrics…")
     try:
-        enrich(client, folder, job, not args.no_lyrics, fetched=metadata.result())
+        fetched = metadata.result()
+        if not job["metadata"].get("release_id"):
+            # A metadata service can be briefly unavailable when the disc is first
+            # inserted. Audio extraction should not depend on the network, but do
+            # make one fresh identification attempt before tagging and importing.
+            say("Retrying album identification…")
+            recovered = identify(client, toc, args.release)
+            if recovered:
+                job["metadata"] = recovered
+                save(jobfile, job)
+                event("album", metadata=recovered, folder=str(folder))
+                fetched = fetch_enrichment(client, folder, job, not args.no_lyrics)
+        enrich(client, folder, job, not args.no_lyrics, fetched=fetched)
         if not args.no_music and audio_format != "flac":
             import_music(folder, job)
     except Exception as exc:

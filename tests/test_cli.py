@@ -327,6 +327,36 @@ class Tests(unittest.TestCase):
         )
         self.assertEqual(mount.call_args.args[0], ["diskutil", "mountDisk", "/dev/disk5"])
 
+    def test_transient_identification_failure_is_retried_before_import(self):
+        args = argparse.Namespace(
+            output=self.folder, release=None, no_music=False, no_eject=False, no_lyrics=True
+        )
+        real_run = app.run
+
+        def run(command, **kwargs):
+            if command[0] == "cd-paranoia":
+                make_wav(command[-1])
+                return Mock()
+            if command[0] in ("diskutil", "osascript"):
+                return Mock()
+            return real_run(command, **kwargs)
+
+        with (
+            patch.object(app, "audio_devices", return_value={"/dev/disk5"}),
+            patch.object(app, "read_toc", return_value=copy.deepcopy(TOC)),
+            patch.object(app, "identify", side_effect=[None, copy.deepcopy(META)]) as identify,
+            patch.object(app, "fetch_enrichment", return_value=(None, [None], [])),
+            patch.object(app, "run", side_effect=run),
+        ):
+            app.process_disc("/dev/disk5", args)
+
+        job = app.load_job(self.folder / TOC["id"])
+        self.assertEqual(identify.call_count, 2)
+        self.assertEqual(job["metadata"]["album"], META["album"])
+        self.assertTrue(job["files"][0]["imported"])
+        tags = MP4(self.folder / TOC["id"] / job["files"][0]["name"])
+        self.assertEqual(tags["\xa9alb"], [META["album"]])
+
     def run_overlapping_pipeline(self, failure=None, resume=False):
         toc = copy.deepcopy(TOC)
         toc.update(last=2, leadout=300)
