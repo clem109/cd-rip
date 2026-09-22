@@ -442,7 +442,7 @@ class Tests(unittest.TestCase):
         def run(command, **kwargs):
             if command[0] == "cd-paranoia":
                 operations.append("read")
-                if command[-2] == "2":
+                if command[-2].startswith("2["):
                     self.assertTrue(encoding.wait(5))
                     second_read.set()
                     if failure == "read":
@@ -547,15 +547,57 @@ class Tests(unittest.TestCase):
                     patch.object(app.time, "sleep"),
                 ):
                     if mode == "recovered":
-                        app.extract_track("/dev/disk5", TOC, 2, self.folder / "x.wav", log)
+                        app.extract_track("/dev/disk5", TOC, 1, self.folder / "x.wav", log)
                     else:
                         with self.assertRaises(RuntimeError):
-                            app.extract_track("/dev/disk5", TOC, 2, self.folder / "x.wav", log)
+                            app.extract_track("/dev/disk5", TOC, 1, self.folder / "x.wav", log)
                 self.assertEqual(
                     sum(c[0] == "cd-paranoia" for c in calls),
                     {"recovered": 2, "busy": 3, "read_error": 1, "changed": 1}[mode],
                 )
                 self.assertFalse(any("force" in c for c in calls))
+
+    def test_extraction_bounds_final_track_and_preserves_failed_pcm(self):
+        toc = {"tracks": [{"number": 10, "sectors": 30259}]}
+        wav = self.folder / "10.partial.wav"
+        wav.write_bytes(b"previous failed read")
+        with patch.object(app, "run") as run:
+            app.extract_track("/dev/disk5", toc, 10, wav, self.folder / "10.rip.log")
+        command = run.call_args.args[0]
+        self.assertEqual(command[-2], "10[.0]-10[.30258]")
+        self.assertIn("-X", command)
+        self.assertEqual(run.call_args.kwargs["expected_bytes"], 30259 * 2352)
+        self.assertEqual(
+            next(self.folder.glob("10.failed-*.wav")).read_bytes(), b"previous failed read"
+        )
+
+    def test_reader_watchdog_stops_overrun_stall_and_user_pause(self):
+        for mode in ("overrun", "stall", "pause", "timeout"):
+            with self.subTest(mode=mode):
+                wav = self.folder / "read.wav"
+                wav.write_bytes(b"x" * (200 if mode == "overrun" else 44))
+                reader = Mock()
+                reader.poll.return_value = None
+                context = Mock()
+                context.__enter__ = Mock(return_value=reader)
+                context.__exit__ = Mock(return_value=False)
+                pause = threading.Event()
+                if mode == "pause":
+                    pause.set()
+                times = [0, 0, 121] if mode == "stall" else [0, 2]
+                with (
+                    patch.object(app.subprocess, "Popen", return_value=context),
+                    patch.object(app.time, "monotonic", side_effect=times),
+                    patch.object(app.time, "sleep"),
+                    patch.object(app, "PAUSE_READ", pause),
+                ):
+                    with self.assertRaises(RuntimeError):
+                        app.monitored_read(
+                            ["reader"], wav, 100, timeout=1 if mode == "timeout" else 1800
+                        )
+                reader.terminate.assert_called_once()
+                reader.wait.assert_called_once_with(timeout=5)
+                self.assertTrue(wav.exists())
 
     def test_prefetch_does_not_mutate_manifest_or_require_audio(self):
         job = {"metadata": copy.deepcopy(META), "toc": copy.deepcopy(TOC), "files": []}

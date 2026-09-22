@@ -36,6 +36,7 @@ UA = f"cd-rip/{__version__} (https://github.com/clem109/cd-rip)"
 GUI = os.environ.get("CD_RIP_GUI") == "1"
 STOP = threading.Event()
 SCAN = threading.Event()
+PAUSE_READ = threading.Event()
 CHOICES = queue.Queue()
 IMPORT_RESULTS = queue.Queue()
 OUTPUT_LOCK = threading.Lock()
@@ -59,6 +60,8 @@ def read_controls():
                 CHOICES.put("")
             elif message.get("command") == "scan":
                 SCAN.set()
+            elif message.get("command") == "pause_read":
+                PAUSE_READ.set()
             elif message.get("command") == "choose":
                 CHOICES.put(str(message.get("choice", "")))
             elif message.get("command") == "import_result":
@@ -78,7 +81,45 @@ def say(message):
 
 
 def run(args, **kwargs):
+    progress_path = kwargs.pop("progress_path", None)
+    expected_bytes = kwargs.pop("expected_bytes", None)
+    if progress_path is not None:
+        return monitored_read(args, progress_path, expected_bytes, **kwargs)
     return subprocess.run([str(a) for a in args], check=True, **kwargs)
+
+
+def monitored_read(args, wav, expected_bytes, timeout=1800, **kwargs):
+    """Bound a drive read by actual output progress, not noisy transport callbacks."""
+    started = changed = time.monotonic()
+    last_size = 0
+    with subprocess.Popen([str(a) for a in args], **kwargs) as reader:
+        try:
+            while reader.poll() is None:
+                now = time.monotonic()
+                size = wav.stat().st_size if wav.exists() else 0
+                if size > expected_bytes + 44:
+                    raise RuntimeError("The reader exceeded this track's audio boundary")
+                if size != last_size:
+                    last_size, changed = size, now
+                if PAUSE_READ.is_set():
+                    raise RuntimeError("Reading paused")
+                if now - changed >= 120:
+                    raise RuntimeError("The drive made no audio progress for two minutes")
+                if now - started >= timeout:
+                    raise RuntimeError("The drive exceeded the track reading time limit")
+                time.sleep(0.25)
+            if reader.returncode:
+                raise subprocess.CalledProcessError(reader.returncode, args)
+            return subprocess.CompletedProcess(args, reader.returncode)
+        except BaseException:
+            if reader.poll() is None:
+                reader.terminate()
+                try:
+                    reader.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    reader.kill()
+                    reader.wait()
+            raise
 
 
 def save(path, obj):
@@ -714,19 +755,33 @@ def check_dependencies():
 
 def extract_track(device, toc, number, wav, logpath):
     """Retry only failure to open a busy drive, never damaged audio or skipped data."""
+    track = next(t for t in toc["tracks"] if t["number"] == number)
+    # Explicit inclusive bounds avoid libcdio treating an enhanced CD's data
+    # session as part of the final audio track. libdiscid already excludes it.
+    span = f"{number}[.0]-{number}[.{track['sectors'] - 1}]"
+    if wav.exists():
+        # Keep failed PCM recoverable and start with a fresh progress file.
+        wav.rename(wav.with_name(f"{number:02}.failed-{time.time_ns()}.wav"))
     for attempt in range(3):
         with logpath.open("ab") as log:
             start = log.tell()
             try:
                 run(
-                    ["cd-paranoia", "-d", device, "-X", "-e", "--", str(number), wav],
+                    ["cd-paranoia", "-d", device, "-X", "-e", "--", span, wav],
                     stdout=log,
                     stderr=log,
                     timeout=1800,
+                    progress_path=wav,
+                    expected_bytes=track["sectors"] * 2352,
                 )
                 return
             except subprocess.CalledProcessError as exc:
                 error = exc
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"{exc}. Saved tracks are safe. Choose Resume Rip to retry track {number}. "
+                    f"Details: {logpath.name}"
+                ) from exc
         with logpath.open("rb") as log:
             log.seek(start)
             output = log.read(65536).decode(errors="replace")
@@ -770,6 +825,7 @@ def prepare_track(wav, target, metadata, index, audio_format, bitrate):
 
 
 def process_disc(device, args):
+    PAUSE_READ.clear()
     if device not in audio_devices():
         raise RuntimeError("Selected device is not a mounted audio CD; refusing to access it")
     toc = read_toc(device)
@@ -805,6 +861,7 @@ def process_disc(device, args):
             "aac_bitrate": bitrate if audio_format == "aac" else None,
         }
         save(jobfile, job)
+    job.pop("rip_error", None)
     if job.get("audio_complete"):
         for entry in job["files"]:
             if (
@@ -938,6 +995,8 @@ def process_disc(device, args):
                 commit_pending()
             except BaseException as encode_error:
                 exc.add_note(f"Pending encoding also failed: {encode_error}")
+            job["rip_error"] = str(exc)
+            save(jobfile, job)
             subprocess.run(["diskutil", "mountDisk", device], capture_output=True, timeout=30)
         finally:
             pool.shutdown(wait=True, cancel_futures=True)

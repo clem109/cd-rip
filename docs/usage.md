@@ -78,10 +78,15 @@ Duplicate detection covers this tool's jobs, not previous Music imports.
 If the drive reports busy when opening a track, the app checks that the same disc is
 inserted, requests a normal unmount, and retries at most twice. It never force-unmounts
 another app or disables secure reading. If the drive remains busy, stop CD playback or
-importing in other apps, stop watching, then choose **Rip Inserted CD** to resume.
+importing in other apps, then choose **Resume Rip**.
 
 Uncorrectable reads stop extraction and leave the disc inserted. Saved tracks and logs remain.
-Clean/reinsert the disc and run `cd-rip rip` to resume. If a crash leaves an unrecorded
+Use **Pause Rip** to stop the current read, then **Resume Rip** to retry the unfinished
+track without rereading completed tracks. The CLI equivalent is `cd-rip rip`.
+Reads stop if no audio is written for two minutes or output exceeds the expected track
+length. Exact audio boundaries prevent enhanced CDs' extra sessions being read as music.
+Failed partial WAVs are retained with a `.failed-…wav` name when retrying.
+Clean/reinsert the disc if a read error persists. If a crash leaves an unrecorded
 `.m4a`, move it aside before retrying; the tool refuses to overwrite it.
 
 Use `--no-eject` to keep a completed CD inserted, or `--device /dev/diskN` with `rip`
@@ -89,7 +94,7 @@ to select a drive. Only mounted audio CDs are accepted.
 
 Watch mode ignores a CD that was already inserted when the watcher started. In the Mac app,
 choose **Scan for CD** to process the currently inserted disc without restarting the watcher.
-The same control retries a disc that previously needed attention while preserving saved tracks.
+For an incomplete album, **Resume Rip** replaces the scan control.
 CD detection uses `diskutil` device metadata and does not inspect the mounted CD filesystem.
 
 ## Limits

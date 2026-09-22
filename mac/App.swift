@@ -34,6 +34,7 @@ final class Ripper: ObservableObject {
     @Published var releaseDetail = ""
     @Published var showSettings = false
     @Published var audioComplete = false
+    var canResume: Bool { folder != nil && !audioComplete && !tracks.isEmpty }
     @Published var editions: [Edition] = []
     @Published var editionCountdown = 0
     @Published var logs: [String] = []
@@ -81,7 +82,7 @@ final class Ripper: ObservableObject {
         if let partial = partial, expected > 0,
            let values = try? partial.resourceValues(forKeys: [.fileSizeKey]),
            let size = values.fileSize {
-            let current = min(1, max(0, Double(size - 44) / expected))
+            let current = min(0.99, max(0, Double(size - 44) / expected))
             fraction = (Double(max(0, track - 1)) + current) / Double(max(1, total))
         }
         if cover == nil, let folder = folder {
@@ -110,7 +111,7 @@ final class Ripper: ObservableObject {
                     self.detail = self.tracks.allSatisfy { $0.imported } ? "All \(self.tracks.count) tracks added to Music." : "Saved in your archive."
                     if let folder = self.folder, let data = try? Data(contentsOf: folder.appendingPathComponent("job.json")),
                        let job = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                       let error = job["postprocess_error"] as? String { self.fail(error) }
+                       let error = (job["rip_error"] ?? job["postprocess_error"]) as? String { self.fail(error) }
                 }
             }
         }
@@ -173,6 +174,10 @@ final class Ripper: ObservableObject {
     }
 
     func fail(_ message: String) {
+        partial = nil
+        encodingTrack = 0
+        refreshAlbum()
+        fraction = Double(tracks.filter { $0.saved }.count) / Double(max(1, total))
         phase = "Needs attention"
         detail = message
         log(message)
@@ -277,6 +282,27 @@ final class Ripper: ObservableObject {
         phase = "Scanning for a CD…"
         detail = "Checking the connected optical drive."
         send(["command": "scan"])
+    }
+
+    func resumeRip() {
+        guard canResume && !checking && !stopping else { return }
+        if running {
+            scan()
+        } else {
+            // Resume in the original archive format even if Settings changed.
+            if let folder, let data = try? Data(contentsOf: folder.appendingPathComponent("job.json")),
+               let job = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                audioFormat = job["format"] as? String ?? "alac"
+                aacBitrate = job["aac_bitrate"] as? Int ?? 256
+            }
+            launch("rip")
+        }
+    }
+
+    func pauseRip() {
+        guard running && partial != nil else { return }
+        detail = "Pausing the current read. Completed tracks will be kept."
+        send(["command": "pause_read"])
     }
 
     func choose(_ choice: Int?) {
@@ -573,12 +599,23 @@ struct ContentView: View {
                 if model.running {
                     Button(model.stopping ? "Finishing…" : "Stop After This CD") { model.stop() }
                         .disabled(model.stopping)
-                    Button("Scan for CD") { model.scan() }
-                        .disabled(model.stopping || !model.canScan)
+                    if model.canResume && model.canScan {
+                        Button("Resume Rip") { model.resumeRip() }
+                            .buttonStyle(.borderedProminent).disabled(model.stopping)
+                    } else if model.partial != nil {
+                        Button("Pause Rip") { model.pauseRip() }.disabled(model.stopping)
+                    } else {
+                        Button("Scan for CD") { model.scan() }
+                            .disabled(model.stopping || !model.canScan)
+                    }
                 } else {
                     Button("Start Watching") { model.launch("watch") }
                         .buttonStyle(.borderedProminent).disabled(model.checking)
-                    Button("Rip Inserted CD") { model.launch("rip") }.disabled(model.checking)
+                    if model.canResume {
+                        Button("Resume Rip") { model.resumeRip() }.disabled(model.checking)
+                    } else {
+                        Button("Rip Inserted CD") { model.launch("rip") }.disabled(model.checking)
+                    }
                 }
                 Spacer()
                 Button("Show in Finder") {
